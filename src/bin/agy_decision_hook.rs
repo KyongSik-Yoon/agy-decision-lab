@@ -1,8 +1,8 @@
 use std::{
     collections::hash_map::DefaultHasher,
-    fs,
+    fs::{self, OpenOptions},
     hash::{Hash, Hasher},
-    io::{self, IsTerminal, Read},
+    io::{self, IsTerminal, Read, Write},
     path::PathBuf,
     time::Duration,
 };
@@ -11,6 +11,7 @@ use agy_decision_lab::{
     gate::evaluate_command_for_hook,
     router::{ModelTargets, classify_prompt_with_timeout},
     stop_gate::{StopHookContext, evaluate_stop_hook},
+    subagent_router::{SubagentRouteOutcome, evaluate_subagent_for_hook, extract_subagent_call},
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -38,6 +39,15 @@ enum HookCmd {
     StopOn,
     /// Stop 완료 체크리스트 검증 훅 일시 중지
     StopOff,
+    /// PreToolUse 서브에이전트·스웜 동적 모델 라우터 활성화
+    SubagentOn,
+    /// PreToolUse 서브에이전트·스웜 동적 모델 라우터 일시 중지
+    SubagentOff,
+    /// 최근 서브에이전트·스웜 라우팅 감사 로그 출력
+    SubagentLog {
+        #[arg(short = 'n', long, default_value_t = 15)]
+        limit: usize,
+    },
     /// 훅 및 안전 검문소 현재 활성화 상태 확인
     Status,
     /// 샘플 프롬프트로 PreInvocation 라우팅 훅 JSON 출력 시뮬레이션
@@ -51,6 +61,25 @@ enum HookCmd {
         command: String,
         #[arg(long)]
         cwd: Option<String>,
+    },
+    /// 샘플 브리프로 서브에이전트·스웜 동적 모델 라우팅 시뮬레이션
+    TestSubagent {
+        prompt: String,
+        /// 대상 도구 종류: swarm | subagent
+        #[arg(long, default_value = "swarm")]
+        kind: String,
+        /// invoke_subagent일 때 TypeName (research | self) 또는 swarm일 때 워커 이름
+        #[arg(long, default_value = "worker")]
+        type_name: String,
+        /// workspace 모드 (inherit | share | branch)
+        #[arg(long, default_value = "inherit")]
+        workspace: String,
+        /// 호출자가 명시한 모델 값 (비어 있으면 기본 생략/inherit)
+        #[arg(long, default_value = "")]
+        requested_model: String,
+        /// 부모 세션 활성 모델 표시명
+        #[arg(long, default_value = "Gemini 4 Carbon (Medium)")]
+        parent_model: String,
     },
     /// 현재 작업 트리의 git diff로 Stop 체크리스트 검증 시뮬레이션
     TestStop {
@@ -116,6 +145,7 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
     let route_flag = route_disabled_flag_path();
     let gate_flag = gate_disabled_flag_path();
     let stop_flag = stop_disabled_flag_path();
+    let subagent_flag = subagent_disabled_flag_path();
 
     match cmd {
         HookCmd::On => {
@@ -148,13 +178,55 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
             write_flag(&stop_flag)?;
             println!("Stop 완료 체크리스트 검증 훅: DISABLED");
         }
+        HookCmd::SubagentOn => {
+            if subagent_flag.exists() {
+                fs::remove_file(&subagent_flag)?;
+            }
+            println!("PreToolUse 서브에이전트·스웜 라우터 훅: ENABLED");
+        }
+        HookCmd::SubagentOff => {
+            write_flag(&subagent_flag)?;
+            println!("PreToolUse 서브에이전트·스웜 라우터 훅: DISABLED");
+        }
+        HookCmd::SubagentLog { limit } => {
+            let log_path = subagent_audit_log_path();
+            match fs::read_to_string(&log_path) {
+                Ok(raw) if !raw.trim().is_empty() => {
+                    let lines: Vec<&str> = raw.lines().collect();
+                    let start = lines.len().saturating_sub(limit);
+                    for line in &lines[start..] {
+                        println!("{line}");
+                    }
+                }
+                _ => {
+                    println!(
+                        "기록된 서브에이전트 라우팅 로그가 아직 없습니다 ({})",
+                        log_path.display()
+                    );
+                }
+            }
+        }
         HookCmd::Status => {
+            let subagent_plugin_mounted = subagent_plugin_link_path().exists();
             println!(
                 "PreToolUse    (명령 안전 검문소):       {}",
                 if gate_flag.exists() {
                     "disabled (gate-off)"
                 } else {
                     "enabled"
+                }
+            );
+            println!(
+                "PreToolUse    (서브에이전트·스웜 라우터): {} (플러그인 마운트: {})",
+                if subagent_flag.exists() {
+                    "disabled (subagent-off)"
+                } else {
+                    "enabled"
+                },
+                if subagent_plugin_mounted {
+                    "mounted"
+                } else {
+                    "unmounted"
                 }
             );
             println!(
@@ -175,6 +247,11 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
             );
             if let Ok(last) = fs::read_to_string(last_route_state_path()) {
                 println!("최근 라우팅 기록: {last}");
+            }
+            if let Ok(raw) = fs::read_to_string(subagent_audit_log_path()) {
+                if let Some(last_sub) = raw.lines().last() {
+                    println!("최근 서브에이전트 라우팅: {last_sub}");
+                }
             }
         }
         HookCmd::Test {
@@ -204,6 +281,57 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "evaluation": eval,
+                    "hook_stdout": hook_stdout,
+                }))?
+            );
+        }
+        HookCmd::TestSubagent {
+            prompt,
+            kind,
+            type_name,
+            workspace,
+            requested_model,
+            parent_model,
+        } => {
+            let (tool_name, args) = if kind.eq_ignore_ascii_case("subagent")
+                || kind.eq_ignore_ascii_case("invoke_subagent")
+            {
+                let eff_type = if type_name == "worker" {
+                    "research".to_string()
+                } else {
+                    type_name
+                };
+                let mut obj = serde_json::json!({
+                    "TypeName": eff_type,
+                    "Role": "Simulated Subagent",
+                    "Workspace": workspace,
+                    "Prompt": prompt,
+                });
+                if !requested_model.trim().is_empty() {
+                    obj["Model"] = serde_json::Value::String(requested_model);
+                }
+                ("invoke_subagent", obj)
+            } else {
+                let mut obj = serde_json::json!({
+                    "action": "add",
+                    "name": type_name,
+                    "workspace": workspace,
+                    "brief": prompt,
+                });
+                if !requested_model.trim().is_empty() {
+                    obj["model"] = serde_json::Value::String(requested_model);
+                }
+                ("swarm", obj)
+            };
+
+            let spec = extract_subagent_call(tool_name, &args, &parent_model)
+                .ok_or_else(|| anyhow::anyhow!("유효한 서브에이전트/스웜 호출 명세를 생성하지 못했습니다"))?;
+            let outcome = evaluate_subagent_for_hook(&spec, Duration::from_millis(3800)).await?;
+            let hook_stdout = hook_json_from_subagent_outcome(&outcome);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "evaluation": outcome,
                     "hook_stdout": hook_stdout,
                 }))?
             );
@@ -321,20 +449,41 @@ fn stop_disabled_flag_path() -> PathBuf {
 }
 
 async fn evaluate_pre_tool_use(envelope: &GenericHookEnvelope) -> Result<serde_json::Value> {
+    let Some(tool) = &envelope.tool_call else {
+        return Ok(serde_json::json!({ "decision": "allow" }));
+    };
+
+    // 1. 서브에이전트(invoke_subagent) 및 네이티브 스웜(swarm add) 동적 모델·추론 강도 라우팅 분기
+    if let Some(spec) = extract_subagent_call(&tool.name, &tool.args, &envelope.model_name) {
+        if subagent_disabled_flag_path().exists()
+            || std::env::var("AGY_SUBAGENT_ROUTER_OFF").as_deref() == Ok("1")
+        {
+            return Ok(serde_json::json!({ "decision": "allow" }));
+        }
+
+        return match evaluate_subagent_for_hook(&spec, Duration::from_millis(2800)).await {
+            Ok(outcome) => {
+                append_subagent_audit_log(&envelope.conversation_id, &envelope.model_name, &outcome);
+                Ok(hook_json_from_subagent_outcome(&outcome))
+            }
+            Err(_) => {
+                // 타임아웃·네트워크 오류 시 에이전트 실행을 절대 방해하지 않고 순정 인자 그대로 통과(Fail-Open)
+                Ok(serde_json::json!({ "decision": "allow" }))
+            }
+        };
+    }
+
+    // 2. 셸 명령(run_command) 안전 검문소 분기
+    if !tool.name.eq_ignore_ascii_case("run_command") {
+        return Ok(serde_json::json!({ "decision": "allow" }));
+    }
+
     if gate_disabled_flag_path().exists() {
         // 주의: PreToolUse에서 빈 객체("{}")를 반환하면 agy가 decision=""를 거부(deny)로 처리하므로,
         // always-proceed 및 agy-route 흐름을 방해하지 않도록 "allow"를 명시적으로 반환합니다.
         return Ok(serde_json::json!({
             "decision": "allow"
         }));
-    }
-
-    let Some(tool) = &envelope.tool_call else {
-        return Ok(serde_json::json!({ "decision": "allow" }));
-    };
-
-    if !tool.name.eq_ignore_ascii_case("run_command") {
-        return Ok(serde_json::json!({ "decision": "allow" }));
     }
 
     let cmd_str = tool
@@ -353,6 +502,61 @@ async fn evaluate_pre_tool_use(envelope: &GenericHookEnvelope) -> Result<serde_j
     let cwd_opt = (!envelope.cwd.trim().is_empty()).then_some(envelope.cwd.as_str());
     let eval = evaluate_command_for_hook(cmd_str, cwd_opt, Duration::from_millis(3800)).await?;
     Ok(hook_json_from_gate_action(&eval.action, &eval.reason))
+}
+
+fn hook_json_from_subagent_outcome(outcome: &SubagentRouteOutcome) -> serde_json::Value {
+    if outcome.rewritten {
+        let mut overwrite = serde_json::Map::new();
+        overwrite.insert(
+            outcome.model_arg_key.clone(),
+            serde_json::Value::String(outcome.selected_model.clone()),
+        );
+        serde_json::json!({
+            "decision": "allow",
+            "reason": outcome.reason,
+            "overwrite": overwrite,
+        })
+    } else {
+        serde_json::json!({
+            "decision": "allow",
+        })
+    }
+}
+
+fn append_subagent_audit_log(
+    conversation_id: &str,
+    parent_model: &str,
+    outcome: &SubagentRouteOutcome,
+) {
+    let path = subagent_audit_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = serde_json::json!({
+        "epoch_sec": ts,
+        "conversation_id": conversation_id,
+        "parent_model": parent_model,
+        "kind": outcome.kind,
+        "target": outcome.target_name,
+        "workspace": outcome.workspace,
+        "requested_model": outcome.requested_model,
+        "selected_model": outcome.selected_model,
+        "rewritten": outcome.rewritten,
+        "guard": outcome.guard_applied,
+        "tier": outcome.route_summary.as_ref().map(|s| s.task_tier.as_str()),
+        "score": outcome.route_summary.as_ref().map(|s| s.complexity_score),
+        "confidence": outcome.route_summary.as_ref().map(|s| s.tier_confidence),
+        "latency_ms": outcome.route_summary.as_ref().map(|s| s.latency_ms),
+    });
+    if let Ok(line) = serde_json::to_string(&record) {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{line}");
+        }
+    }
 }
 
 fn hook_json_from_gate_action(action: &str, reason: &str) -> serde_json::Value {
@@ -646,4 +850,17 @@ fn route_disabled_flag_path() -> PathBuf {
 
 fn gate_disabled_flag_path() -> PathBuf {
     state_dir().join("gate-disabled")
+}
+
+fn subagent_disabled_flag_path() -> PathBuf {
+    state_dir().join("subagent-disabled")
+}
+
+fn subagent_audit_log_path() -> PathBuf {
+    state_dir().join("subagent-routes.jsonl")
+}
+
+fn subagent_plugin_link_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".gemini/config/plugins/decision-subagent")
 }

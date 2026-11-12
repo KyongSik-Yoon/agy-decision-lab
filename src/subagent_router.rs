@@ -1,0 +1,722 @@
+use std::time::Duration;
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::router::{ModelTargets, RouteDecisionSummary, classify_prompt_with_timeout, env_or};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentToolKind {
+    InvokeSubagent,
+    SwarmAdd,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentCallSpec {
+    pub kind: SubagentToolKind,
+    /// invoke_subagent: TypeName (예: research, self), swarm: 워커 name
+    pub target_name: String,
+    /// invoke_subagent: Role, swarm: action ("add")
+    pub role_or_action: String,
+    /// workspace 모드 ("inherit" | "share" | "branch")
+    pub workspace: String,
+    /// swarm fork 여부
+    pub has_fork: bool,
+    /// 호출자가 원래 넣은 모델 값 (비어 있으면 "")
+    pub requested_model: String,
+    /// overwrite에 사용할 정확한 인자 키 이름 ("Model" 또는 "model")
+    pub model_arg_key: String,
+    /// 부모 세션의 현재 활성 모델 표시명 (예: "Gemini 4 Carbon (Medium)")
+    pub parent_model: String,
+    /// Decision API에 전달할 통합 평가 텍스트
+    pub evaluation_prompt: String,
+    /// swarm_monitor 전용 경량 헬퍼 여부
+    pub is_swarm_monitor: bool,
+    /// 라우팅 제외 특수 에이전트 여부 (예: image-generator)
+    pub bypass_routing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentRouteOutcome {
+    pub kind: SubagentToolKind,
+    pub target_name: String,
+    pub workspace: String,
+    pub requested_model: String,
+    pub selected_model: String,
+    pub model_arg_key: String,
+    pub rewritten: bool,
+    pub guard_applied: Option<String>,
+    pub reason: String,
+    pub route_summary: Option<RouteDecisionSummary>,
+}
+
+/// PreToolUse의 toolCall 이름과 인자에서 서브에이전트/스웜 스폰 호출인지 판별하고 명세를 추출합니다.
+pub fn extract_subagent_call(
+    tool_name: &str,
+    args: &Value,
+    parent_model: &str,
+) -> Option<SubagentCallSpec> {
+    if tool_name.eq_ignore_ascii_case("invoke_subagent") {
+        let type_name = get_str_ci(args, &["TypeName", "typeName", "type_name"])
+            .unwrap_or("self")
+            .trim()
+            .to_string();
+        let role = get_str_ci(args, &["Role", "role"])
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let prompt = get_str_ci(args, &["Prompt", "prompt"])
+            .unwrap_or("")
+            .trim();
+        if prompt.is_empty() {
+            return None;
+        }
+        let workspace = get_str_ci(args, &["Workspace", "workspace"])
+            .unwrap_or("inherit")
+            .trim()
+            .to_string();
+        let (requested_model, model_arg_key) = if let Some(v) = args.get("Model").and_then(Value::as_str) {
+            (v.trim().to_string(), "Model".to_string())
+        } else if let Some(v) = args.get("model").and_then(Value::as_str) {
+            (v.trim().to_string(), "model".to_string())
+        } else {
+            (String::new(), "Model".to_string())
+        };
+
+        let lower_type = type_name.to_ascii_lowercase();
+        let bypass_routing = matches!(
+            lower_type.as_str(),
+            "image-generator" | "image_generator" | "browser"
+        );
+
+        let evaluation_prompt = format!(
+            "[Subagent Archetype: {type_name} | Role: {role} | Workspace: {workspace}]\n{prompt}"
+        );
+
+        return Some(SubagentCallSpec {
+            kind: SubagentToolKind::InvokeSubagent,
+            target_name: type_name,
+            role_or_action: role,
+            workspace,
+            has_fork: false,
+            requested_model,
+            model_arg_key,
+            parent_model: parent_model.trim().to_string(),
+            evaluation_prompt,
+            is_swarm_monitor: false,
+            bypass_routing,
+        });
+    }
+
+    // swarm 도구는 바이너리 내부에서 "swarm" 또는 generic 스텝("generic")으로 전달될 수 있으므로 시그니처로 교차 검증
+    if tool_name.eq_ignore_ascii_case("swarm") || tool_name.eq_ignore_ascii_case("generic") {
+        let action = get_str_ci(args, &["action"])?;
+        if !action.eq_ignore_ascii_case("add") {
+            return None;
+        }
+        let brief = get_str_ci(args, &["brief"])?.trim();
+        if brief.is_empty() {
+            return None;
+        }
+        let worker_name = get_str_ci(args, &["name"])
+            .unwrap_or("worker")
+            .trim()
+            .to_string();
+        let workspace = get_str_ci(args, &["workspace"])
+            .unwrap_or("inherit")
+            .trim()
+            .to_string();
+        let has_fork = get_str_ci(args, &["fork"])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let requested_model = get_str_ci(args, &["model"])
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let tasks_snippet = args
+            .get("tasks")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                let joined: Vec<&str> = arr.iter().filter_map(Value::as_str).take(6).collect();
+                if joined.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n[Sharded Tasks ({} items)]: {}", arr.len(), joined.join(" | "))
+                }
+            })
+            .unwrap_or_default();
+
+        let lower_brief = brief.to_ascii_lowercase();
+        let is_swarm_monitor = worker_name.eq_ignore_ascii_case("monitor")
+            || lower_brief.contains("swarm_monitor");
+
+        let evaluation_prompt = format!(
+            "[Swarm Worker: name={worker_name} | workspace={workspace} | fork={has_fork}]\n{brief}{tasks_snippet}"
+        );
+
+        return Some(SubagentCallSpec {
+            kind: SubagentToolKind::SwarmAdd,
+            target_name: worker_name,
+            role_or_action: "add".to_string(),
+            workspace,
+            has_fork,
+            requested_model,
+            model_arg_key: "model".to_string(),
+            parent_model: parent_model.trim().to_string(),
+            evaluation_prompt,
+            is_swarm_monitor,
+            bypass_routing: false,
+        });
+    }
+
+    None
+}
+
+pub async fn evaluate_subagent_for_hook(
+    spec: &SubagentCallSpec,
+    timeout: Duration,
+) -> Result<SubagentRouteOutcome> {
+    let targets = ModelTargets::from_env();
+
+    if spec.bypass_routing {
+        return Ok(passthrough_outcome(
+            spec,
+            "특수 목적 내장 서브에이전트 — 라우팅 생략",
+            Some("special_subagent_bypass"),
+            None,
+        ));
+    }
+
+    // 사용자가 명시적 모델 지정을 무조건 우선하도록 환경변수를 켠 경우
+    if env_flag("AGY_SUBAGENT_RESPECT_EXPLICIT", false)
+        && !spec.requested_model.is_empty()
+        && !spec.requested_model.eq_ignore_ascii_case("inherit")
+    {
+        return Ok(passthrough_outcome(
+            spec,
+            "명시적 지정 모델 존중(AGY_SUBAGENT_RESPECT_EXPLICIT=1)",
+            Some("respect_explicit"),
+            None,
+        ));
+    }
+
+    // 스웜 모니터 워커는 주기적 상태 점검만 수행하므로 API 호출 없이 경량 모델 즉시 할당
+    if spec.kind == SubagentToolKind::SwarmAdd && spec.is_swarm_monitor {
+        if !spec.requested_model.is_empty() {
+            return Ok(passthrough_outcome(
+                spec,
+                "스웜 모니터 워커 — 지정된 모델 유지",
+                Some("swarm_monitor_keep"),
+                None,
+            ));
+        }
+        let monitor_model = targets.variant("flash", "low");
+        return Ok(SubagentRouteOutcome {
+            kind: spec.kind,
+            target_name: spec.target_name.clone(),
+            workspace: spec.workspace.clone(),
+            requested_model: spec.requested_model.clone(),
+            selected_model: monitor_model.clone(),
+            model_arg_key: spec.model_arg_key.clone(),
+            rewritten: true,
+            guard_applied: Some("swarm_monitor_fastpath".to_string()),
+            reason: format!("swarm_monitor 경량 폴링 워커 -> {monitor_model}"),
+            route_summary: None,
+        });
+    }
+
+    let threshold = std::env::var("AGY_SUBAGENT_CONFIDENCE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| {
+            std::env::var("AGY_CONFIDENCE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.68)
+        });
+
+    let summary = classify_prompt_with_timeout(
+        &spec.evaluation_prompt,
+        threshold,
+        &targets,
+        timeout,
+    )
+    .await?;
+
+    Ok(resolve_subagent_policy(spec, summary, &targets))
+}
+
+/// Decision API 응답 요약과 안전 가드레일(작성자 하한선, 교차 검증 보존, 과도한 강등 방지)을 결합해 최종 모델을 결정합니다.
+pub fn resolve_subagent_policy(
+    spec: &SubagentCallSpec,
+    summary: RouteDecisionSummary,
+    targets: &ModelTargets,
+) -> SubagentRouteOutcome {
+    match spec.kind {
+        SubagentToolKind::SwarmAdd => resolve_swarm_add_policy(spec, summary, targets),
+        SubagentToolKind::InvokeSubagent => resolve_invoke_subagent_policy(spec, summary),
+    }
+}
+
+fn resolve_swarm_add_policy(
+    spec: &SubagentCallSpec,
+    summary: RouteDecisionSummary,
+    targets: &ModelTargets,
+) -> SubagentRouteOutcome {
+    let preserve_cross_family = env_flag("AGY_SUBAGENT_PRESERVE_CROSS_FAMILY", true);
+    let is_author_worker = is_mutating_workspace(&spec.workspace) || spec.has_fork;
+    let recommended_level = extract_effort_suffix(&summary.selected_model).unwrap_or("medium");
+
+    // 1. 타 벤더(Claude / GPT 등) 교차 검증 모델이 명시된 경우 패밀리를 깨뜨리지 않고 보존하되,
+    //    추론 강도 접미사가 있는 모델(claude-*)은 필요 시 상향만 허용(강등 금지)
+    if preserve_cross_family
+        && !spec.requested_model.is_empty()
+        && is_external_vendor_model(&spec.requested_model, targets)
+    {
+        if let Some((ext_base, cur_eff)) = split_effort_model(&spec.requested_model) {
+            if effort_rank(recommended_level) > effort_rank(cur_eff) && summary.complexity_score >= 2.0 {
+                let upgraded = format!("{ext_base}-{recommended_level}");
+                return SubagentRouteOutcome {
+                    kind: spec.kind,
+                    target_name: spec.target_name.clone(),
+                    workspace: spec.workspace.clone(),
+                    requested_model: spec.requested_model.clone(),
+                    selected_model: upgraded.clone(),
+                    model_arg_key: spec.model_arg_key.clone(),
+                    rewritten: true,
+                    guard_applied: Some("preserve_cross_family_upgrade_effort".to_string()),
+                    reason: format!(
+                        "타 패밀리 교차 검증 보존 + 고복잡도({:.2}) 추론 강도 상향: {} -> {}",
+                        summary.complexity_score, spec.requested_model, upgraded
+                    ),
+                    route_summary: Some(summary),
+                };
+            }
+        }
+        return passthrough_outcome(
+            spec,
+            "타 패밀리 교차 검증 모델 명시 — 패밀리 및 강도 보존",
+            Some("preserve_cross_family"),
+            Some(summary),
+        );
+    }
+
+    let mut final_family = summary.selected_family.clone();
+    let mut final_level = recommended_level.to_string();
+    let mut guard_applied: Option<String> = None;
+
+    // 2. 작성자 워커 하한선(Author Floor): share / branch / fork 워커는 코드를 직접 수정하므로 Flash 강등 차단
+    if is_author_worker && final_family == "flash" {
+        final_family = "argon".to_string();
+        final_level = if summary.complexity_score < 1.35 {
+            "low".to_string()
+        } else {
+            "medium".to_string()
+        };
+        guard_applied = Some("author_floor_argon".to_string());
+    }
+
+    // 3. 명시적 Carbon 지정 시 보수적 강등 방지(High-Tier Guard):
+    //    호출자가 이미 carbon 모델을 찍었을 때는 확신도가 충분히 높고(>=0.82) 작성자 워커가 아닐 때만 절감 허용
+    let req_lower = spec.requested_model.to_ascii_lowercase();
+    if req_lower.contains("carbon") && final_family != "carbon" {
+        if is_author_worker || summary.tier_confidence < 0.82 || summary.complexity_score >= 1.65 {
+            final_family = "carbon".to_string();
+            let req_eff = extract_effort_suffix(&req_lower).unwrap_or("medium");
+            if effort_rank(&final_level) < effort_rank(req_eff) && summary.complexity_confidence < 0.78 {
+                final_level = req_eff.to_string();
+            }
+            guard_applied = Some("explicit_carbon_downgrade_guard".to_string());
+        }
+    }
+
+    let selected_model = targets.variant(&final_family, &final_level);
+    let rewritten = !spec.requested_model.eq_ignore_ascii_case(&selected_model);
+
+    let reason = format!(
+        "Decision swarm 라우팅(tier={}, score={:.2}, conf={:.0}%{}) -> {}",
+        summary.task_tier,
+        summary.complexity_score,
+        summary.tier_confidence * 100.0,
+        guard_applied
+            .as_deref()
+            .map(|g| format!(", guard={g}"))
+            .unwrap_or_default(),
+        selected_model
+    );
+
+    SubagentRouteOutcome {
+        kind: spec.kind,
+        target_name: spec.target_name.clone(),
+        workspace: spec.workspace.clone(),
+        requested_model: spec.requested_model.clone(),
+        selected_model,
+        model_arg_key: spec.model_arg_key.clone(),
+        rewritten,
+        guard_applied,
+        reason,
+        route_summary: Some(summary),
+    }
+}
+
+fn resolve_invoke_subagent_policy(
+    spec: &SubagentCallSpec,
+    summary: RouteDecisionSummary,
+) -> SubagentRouteOutcome {
+    let is_research = spec.target_name.eq_ignore_ascii_case("research");
+    let is_mutating_ws = is_mutating_workspace(&spec.workspace);
+    let parent_tier = infer_parent_tier(&spec.parent_model);
+    let effective_req = if spec.requested_model.is_empty() {
+        "inherit"
+    } else {
+        spec.requested_model.as_str()
+    };
+
+    let mut guard_applied: Option<String> = None;
+
+    // invoke_subagent 허용 티어: "inherit" | "flash_lite" | "flash" | "pro"
+    let mut target_tier = if is_research {
+        if summary.selected_family == "flash"
+            && summary.complexity_score < 0.45
+            && summary.tier_confidence >= 0.82
+        {
+            "flash_lite"
+        } else if summary.selected_family == "flash"
+            || (summary.selected_family == "argon" && summary.complexity_score < 1.90)
+        {
+            "flash"
+        } else if parent_tier >= 2 {
+            // 부모가 이미 Carbon/Opus급이면 고난도 리서치 시 추론 강도까지 물려받는 inherit 우선
+            "inherit"
+        } else {
+            "pro"
+        }
+    } else {
+        // self 또는 커스텀 에이전트 (코드 작성·명령 실행 가능): flash_lite 절대 금지
+        match summary.selected_family.as_str() {
+            "flash" => {
+                if !is_mutating_ws
+                    && summary.complexity_score < 1.05
+                    && summary.tier_confidence >= 0.82
+                {
+                    "flash"
+                } else {
+                    guard_applied = Some("exec_subagent_floor".to_string());
+                    if parent_tier == 0 {
+                        "pro"
+                    } else {
+                        "inherit"
+                    }
+                }
+            }
+            "argon" => {
+                if parent_tier == 0 {
+                    // 부모가 Flash일 때 기능 구현 서브에이전트는 pro로 승격하여 성능 저하 방지
+                    "pro"
+                } else if parent_tier == 1 {
+                    "inherit"
+                } else {
+                    // 부모가 Carbon일 때: 확실히 단순한 밸런스 작업일 때만 pro로 완만히 절감, 애매하면 inherit 유지
+                    if !is_mutating_ws
+                        && summary.tier_confidence >= 0.82
+                        && summary.complexity_score < 1.55
+                    {
+                        "pro"
+                    } else {
+                        guard_applied = Some("preserve_parent_carbon_effort".to_string());
+                        "inherit"
+                    }
+                }
+            }
+            _ => {
+                // carbon_complex / carbon_frontier
+                if parent_tier >= 2 {
+                    "inherit"
+                } else {
+                    "pro"
+                }
+            }
+        }
+    };
+
+    // 호출자가 명시적으로 "pro"를 지정한 경우, 확실한 단순 research 조회가 아니면 강등 금지
+    if effective_req.eq_ignore_ascii_case("pro")
+        && matches!(target_tier, "flash" | "flash_lite")
+        && !(is_research && summary.tier_confidence >= 0.85 && summary.complexity_score < 1.10)
+    {
+        target_tier = "pro";
+        guard_applied = Some("explicit_pro_downgrade_guard".to_string());
+    }
+
+    let rewritten = !effective_req.eq_ignore_ascii_case(target_tier);
+    let reason = format!(
+        "Decision subagent 라우팅(type={}, tier={}, score={:.2}, conf={:.0}%{}) -> {}",
+        spec.target_name,
+        summary.task_tier,
+        summary.complexity_score,
+        summary.tier_confidence * 100.0,
+        guard_applied
+            .as_deref()
+            .map(|g| format!(", guard={g}"))
+            .unwrap_or_default(),
+        target_tier
+    );
+
+    SubagentRouteOutcome {
+        kind: spec.kind,
+        target_name: spec.target_name.clone(),
+        workspace: spec.workspace.clone(),
+        requested_model: effective_req.to_string(),
+        selected_model: target_tier.to_string(),
+        model_arg_key: spec.model_arg_key.clone(),
+        rewritten,
+        guard_applied,
+        reason,
+        route_summary: Some(summary),
+    }
+}
+
+fn passthrough_outcome(
+    spec: &SubagentCallSpec,
+    msg: &str,
+    guard: Option<&str>,
+    summary: Option<RouteDecisionSummary>,
+) -> SubagentRouteOutcome {
+    let cur = if spec.requested_model.is_empty() {
+        "inherit".to_string()
+    } else {
+        spec.requested_model.clone()
+    };
+    SubagentRouteOutcome {
+        kind: spec.kind,
+        target_name: spec.target_name.clone(),
+        workspace: spec.workspace.clone(),
+        requested_model: spec.requested_model.clone(),
+        selected_model: cur,
+        model_arg_key: spec.model_arg_key.clone(),
+        rewritten: false,
+        guard_applied: guard.map(ToString::to_string),
+        reason: msg.to_string(),
+        route_summary: summary,
+    }
+}
+
+fn get_str_ci<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    for k in keys {
+        if let Some(v) = args.get(*k).and_then(Value::as_str) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn env_flag(key: &str, default: bool) -> bool {
+    let raw = env_or(key, if default { "1" } else { "0" });
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+fn is_mutating_workspace(ws: &str) -> bool {
+    matches!(ws.trim().to_ascii_lowercase().as_str(), "share" | "branch")
+}
+
+fn infer_parent_tier(model_name: &str) -> u8 {
+    let lower = model_name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        // 알 수 없을 때는 보수적으로 밸런스(1) 취급
+        1
+    } else if lower.contains("flash") {
+        0
+    } else if lower.contains("carbon") || lower.contains("opus") {
+        2
+    } else {
+        1
+    }
+}
+
+fn is_external_vendor_model(model: &str, targets: &ModelTargets) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    let known_bases = [
+        targets.flash_base.to_ascii_lowercase(),
+        targets.argon_base.to_ascii_lowercase(),
+        targets.carbon_base.to_ascii_lowercase(),
+    ];
+    if known_bases.iter().any(|b| lower.starts_with(b)) {
+        return false;
+    }
+    !lower.starts_with("gemini-")
+}
+
+fn split_effort_model(model: &str) -> Option<(&str, &str)> {
+    for eff in ["low", "medium", "high"] {
+        let suffix = format!("-{eff}");
+        if model.len() > suffix.len() && model.to_ascii_lowercase().ends_with(&suffix) {
+            let split_at = model.len() - suffix.len();
+            return Some((&model[..split_at], eff));
+        }
+    }
+    None
+}
+
+fn extract_effort_suffix(model: &str) -> Option<&'static str> {
+    let lower = model.to_ascii_lowercase();
+    if lower.ends_with("-low") {
+        Some("low")
+    } else if lower.ends_with("-medium") {
+        Some("medium")
+    } else if lower.ends_with("-high") {
+        Some("high")
+    } else {
+        None
+    }
+}
+
+fn effort_rank(eff: &str) -> u8 {
+    match eff {
+        "low" => 1,
+        "medium" => 2,
+        "high" => 3,
+        _ => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn default_targets() -> ModelTargets {
+        ModelTargets {
+            flash_base: "gemini-3.8-flash".to_string(),
+            argon_base: "gemini-4-argon".to_string(),
+            carbon_base: "gemini-4-carbon".to_string(),
+        }
+    }
+
+    fn mock_summary(
+        selected_model: &str,
+        family: &str,
+        tier: &str,
+        score: f64,
+        conf: f64,
+    ) -> RouteDecisionSummary {
+        RouteDecisionSummary {
+            selected_model: selected_model.to_string(),
+            selected_family: family.to_string(),
+            cli_effort_flag: None,
+            recommended_effort: extract_effort_suffix(selected_model)
+                .unwrap_or("medium")
+                .to_string(),
+            task_tier: tier.to_string(),
+            tier_confidence: conf,
+            tier_probabilities: BTreeMap::new(),
+            complexity_score: score,
+            complexity_confidence: conf,
+            escalated_by_confidence_gate: false,
+            latency_ms: 210,
+            input_tokens: 80,
+            output_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn swarm_non_add_actions_are_ignored() {
+        let args = serde_json::json!({ "action": "status" });
+        assert!(extract_subagent_call("swarm", &args, "Gemini 4 Carbon (Medium)").is_none());
+        assert!(extract_subagent_call("generic", &args, "Gemini 4 Carbon (Medium)").is_none());
+    }
+
+    #[test]
+    fn swarm_author_worker_never_drops_to_flash() {
+        let args = serde_json::json!({
+            "action": "add",
+            "name": "author",
+            "workspace": "share",
+            "brief": "Update typo and add small helper in config.rs"
+        });
+        let spec = extract_subagent_call("swarm", &args, "Gemini 4 Carbon (Medium)").unwrap();
+        let summary = mock_summary("gemini-3.8-flash-low", "flash", "flash_quick", 0.6, 0.90);
+        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        assert!(out.rewritten);
+        assert_eq!(out.selected_model, "gemini-4-argon-low");
+        assert_eq!(out.guard_applied.as_deref(), Some("author_floor_argon"));
+    }
+
+    #[test]
+    fn swarm_cross_family_claude_reviewer_is_preserved_and_upgraded_if_complex() {
+        let args = serde_json::json!({
+            "action": "add",
+            "name": "reviewer",
+            "workspace": "inherit",
+            "model": "claude-sonnet-5-5-low",
+            "brief": "Audit lock ordering and race conditions across async channels"
+        });
+        let spec = extract_subagent_call("generic", &args, "Gemini 4 Carbon (Medium)").unwrap();
+        let summary = mock_summary(
+            "gemini-4-carbon-high",
+            "carbon",
+            "carbon_frontier",
+            3.4,
+            0.91,
+        );
+        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        assert!(out.rewritten);
+        assert_eq!(out.selected_model, "claude-sonnet-5-5-high");
+    }
+
+    #[test]
+    fn invoke_subagent_research_scales_down_to_flash_on_carbon_parent() {
+        let args = serde_json::json!({
+            "TypeName": "research",
+            "Role": "Config Finder",
+            "Prompt": "Find all files defining DEFAULT_DECISIONS_ENDPOINT and list line numbers."
+        });
+        let spec =
+            extract_subagent_call("invoke_subagent", &args, "Gemini 4 Carbon (High)").unwrap();
+        let summary = mock_summary("gemini-3.8-flash-medium", "flash", "flash_quick", 0.85, 0.88);
+        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        assert!(out.rewritten);
+        assert_eq!(out.model_arg_key, "Model");
+        assert_eq!(out.selected_model, "flash");
+    }
+
+    #[test]
+    fn invoke_subagent_self_on_carbon_parent_keeps_inherit_when_complex() {
+        let args = serde_json::json!({
+            "TypeName": "self",
+            "Role": "Concurrency Fixer",
+            "Workspace": "branch",
+            "Prompt": "Diagnose and fix deadlock in multi-worker dispatcher."
+        });
+        let spec =
+            extract_subagent_call("invoke_subagent", &args, "Gemini 4 Carbon (High)").unwrap();
+        let summary = mock_summary(
+            "gemini-4-carbon-high",
+            "carbon",
+            "carbon_frontier",
+            3.5,
+            0.93,
+        );
+        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        assert!(!out.rewritten);
+        assert_eq!(out.selected_model, "inherit");
+    }
+
+    #[test]
+    fn invoke_subagent_self_on_flash_parent_upgrades_to_pro() {
+        let args = serde_json::json!({
+            "TypeName": "self",
+            "Role": "Feature Builder",
+            "Prompt": "Implement retry backoff and unit tests for client.rs"
+        });
+        let spec =
+            extract_subagent_call("invoke_subagent", &args, "Gemini 3.8 Flash (Low)").unwrap();
+        let summary = mock_summary("gemini-4-argon-medium", "argon", "argon_feature", 1.7, 0.85);
+        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        assert!(out.rewritten);
+        assert_eq!(out.selected_model, "pro");
+    }
+}

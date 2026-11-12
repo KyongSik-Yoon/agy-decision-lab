@@ -1,0 +1,7 @@
+{
+  "name": "decision-subagent",
+  "version": "0.1.0",
+  "description": "Gemini Decision 1 기반 서브에이전트·스웜 스폰 동적 모델·추론 강도 라우터 (프롬프트 캐시 보존 및 작성자 하한선 가드 포함)",
+  "author": "sam",
+  "logo": "assets/logo.svg"
+}

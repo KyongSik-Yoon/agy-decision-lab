@@ -1,0 +1,17 @@
+{
+  "decision-subagent-router": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "invoke_subagent|swarm|generic",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.local/bin/agy-decision-hook",
+            "timeout": 4
+          }
+        ]
+      }
+    ]
+  }
+}
