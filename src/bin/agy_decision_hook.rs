@@ -127,7 +127,7 @@ struct DedupCache {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
+    let _ = agy_decision_lab::runtime_config::load_runtime_env();
     let cli = Cli::parse();
 
     if let Some(sub) = cli.command {
@@ -207,35 +207,47 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
             }
         }
         HookCmd::Status => {
-            let subagent_plugin_mounted = subagent_plugin_link_path().exists();
+            let subagent_install_mode = detect_plugin_install_mode("decision-subagent");
+            let cfg_env = agy_decision_lab::runtime_config::user_config_env_path();
+            let has_api_key = std::env::var("GEMINI_API_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty() && v != "your_ai_studio_api_key_here")
+                .is_some();
             println!(
-                "PreToolUse    (명령 안전 검문소):       {}",
+                "Config        (XDG 설정·API 키):        {} (GEMINI_API_KEY: {})",
+                if cfg_env.is_file() {
+                    cfg_env.display().to_string()
+                } else {
+                    format!("{} (미생성 — 환경변수/CWD 폴백)", cfg_env.display())
+                },
+                if has_api_key { "configured" } else { "missing" }
+            );
+            println!(
+                "PreToolUse    (명령 안전 검문소):       {} (플러그인: {})",
                 if gate_flag.exists() {
                     "disabled (gate-off)"
                 } else {
                     "enabled"
-                }
+                },
+                detect_plugin_install_mode("decision")
             );
             println!(
-                "PreToolUse    (서브에이전트·스웜 라우터): {} (플러그인 마운트: {})",
+                "PreToolUse    (서브에이전트·스웜 라우터): {} (플러그인: {})",
                 if subagent_flag.exists() {
                     "disabled (subagent-off)"
                 } else {
                     "enabled"
                 },
-                if subagent_plugin_mounted {
-                    "mounted"
-                } else {
-                    "unmounted"
-                }
+                subagent_install_mode
             );
             println!(
-                "Stop          (완료 체크리스트 검증):   {}",
+                "Stop          (완료 체크리스트 검증):   {} (플러그인: {})",
                 if stop_flag.exists() {
                     "disabled (stop-off)"
                 } else {
-                    "enabled (decision-stop 플러그인 활성 시 동작)"
-                }
+                    "enabled"
+                },
+                detect_plugin_install_mode("decision-stop")
             );
             println!(
                 "PreInvocation (레거시 자문 훅):         {} (플러그인 기본 구성에서는 비등록)",
@@ -860,7 +872,27 @@ fn subagent_audit_log_path() -> PathBuf {
     state_dir().join("subagent-routes.jsonl")
 }
 
-fn subagent_plugin_link_path() -> PathBuf {
+fn detect_plugin_install_mode(plugin_name: &str) -> &'static str {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".gemini/config/plugins/decision-subagent")
+    let home_path = PathBuf::from(home);
+
+    let candidates = [
+        home_path
+            .join(".gemini/antigravity-cli/plugins")
+            .join(plugin_name),
+        home_path.join(".gemini/antigravity/plugins").join(plugin_name),
+        home_path.join(".gemini/config/plugins").join(plugin_name),
+    ];
+
+    for p in &candidates {
+        if let Ok(meta) = fs::symlink_metadata(p) {
+            if meta.file_type().is_symlink() {
+                return "legacy-symlink";
+            }
+            if meta.is_dir() {
+                return "managed-package";
+            }
+        }
+    }
+    "not-installed"
 }

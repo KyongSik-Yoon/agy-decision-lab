@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.local/bin/agy-decision-hook",
+            "command": "./bin/agy-decision-hook",
             "timeout": 5
           }
         ]

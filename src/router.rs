@@ -163,7 +163,7 @@ pub async fn classify_prompt_with_media_timeout(
     targets: &ModelTargets,
     timeout: Duration,
 ) -> Result<RouteDecisionSummary> {
-    let _ = dotenvy::dotenv();
+    let _ = crate::runtime_config::load_runtime_env();
     let api_key = std::env::var("GEMINI_API_KEY")
         .ok()
         .filter(|v| !v.trim().is_empty() && v != "your_ai_studio_api_key_here")

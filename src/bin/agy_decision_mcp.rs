@@ -85,15 +85,8 @@ impl DecisionMcpServer {
     fn new() -> Self {
         let default_rules_path = std::env::var("AGY_RULES_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("rules/default_rules.yaml"));
+            .unwrap_or_else(|_| agy_decision_lab::runtime_config::user_rules_path());
         Self { default_rules_path }
-    }
-
-    fn resolve_rules_path(&self, override_path: Option<&str>) -> PathBuf {
-        override_path
-            .filter(|p| !p.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.default_rules_path.clone())
     }
 }
 
@@ -135,8 +128,19 @@ impl DecisionMcpServer {
 
 impl DecisionMcpServer {
     async fn run_scan_checklist(&self, args: ScanChecklistArgs) -> Result<serde_json::Value> {
-        let rules_path = self.resolve_rules_path(args.rules_path.as_deref());
-        let rule_set = RuleSet::load_from_path(&rules_path)?;
+        let explicit_override = args
+            .rules_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(std::path::Path::new);
+        let rule_set = if explicit_override.is_some() {
+            agy_decision_lab::runtime_config::load_ruleset_with_fallback(explicit_override)?
+        } else if self.default_rules_path.is_file() {
+            RuleSet::load_from_path(&self.default_rules_path)?
+        } else {
+            agy_decision_lab::runtime_config::load_ruleset_with_fallback(None)?
+        };
         let (mut questions, rule_meta) = rule_set.build_questions(args.category.as_deref());
 
         let mut extra_thresholds = BTreeMap::new();
@@ -392,7 +396,7 @@ fn json_error(message: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
+    let _ = agy_decision_lab::runtime_config::load_runtime_env();
 
     // stdio MCP 서버는 stdout을 JSON-RPC 전용으로 사용하므로 모든 로그는 반드시 stderr로 기록합니다.
     tracing_subscriber::fmt()

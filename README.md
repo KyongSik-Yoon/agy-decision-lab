@@ -9,6 +9,18 @@
 5. **네이티브 `decision-subagent` 플러그인 (`plugins/decision-subagent`)**: 메인 에이전트의 프롬프트 캐시를 깨뜨리지 않고 하위 서브에이전트(`invoke_subagent`) 및 스웜 워커(`swarm add`) 스폰 시점에 `PreToolUse` `overwrite`로 최적 모델과 추론 강도(`low`/`medium`/`high`)를 자동 주입하는 독립 플러그인
 6. **로컬 stdio MCP 서버 (`agy-decision-mcp`)**: [`rmcp`](https://crates.io/crates/rmcp) 기반 대규모 diff 체크리스트 일괄 스캔 및 멀티모달 다중 판별 도구
 
+## 빌드·패키징 및 정식 배포 설치
+
+심볼릭 링크 없이 독립된 배포 패키지(`dist/`)를 조립하고 `agy plugin install` 및 `~/.local/bin` 네이티브 바이너리·`~/.config/agy-decision-lab/config.env` 표준 설정으로 설치합니다(설치 후에는 소스 저장소를 이동·삭제해도 단독 동작합니다):
+
+```bash
+# 원클릭 빌드 + 패키징(dist/*.tar.gz) + 정식 플러그인·바이너리 설치
+./scripts/install.sh
+
+# 설치 없이 배포판 번들 및 tar.gz 아카이브만 생성
+./scripts/install.sh --package-only
+```
+
 ## 주요 제어 명령어
 
 ```bash

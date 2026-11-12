@@ -4,6 +4,7 @@ pub mod render;
 pub mod repl_ui;
 pub mod router;
 pub mod rules;
+pub mod runtime_config;
 pub mod stop_gate;
 pub mod subagent_router;
 pub mod types;

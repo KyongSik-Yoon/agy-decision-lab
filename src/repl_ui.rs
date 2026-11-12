@@ -362,15 +362,9 @@ pub enum ReadLineTurnOutcome {
     Exit,
 }
 
-/// 현재 작업 디렉터리의 `.env`를 우선 읽고, `GEMINI_API_KEY`가 없으면 빌드된 저장소의 `.env`를 폴백으로 로드합니다.
+/// 표준 XDG 설정(`~/.config/agy-decision-lab/config.env`) 및 런타임 환경변수를 로드합니다.
 pub fn load_lab_dotenv() {
-    let _ = dotenvy::dotenv();
-    if std::env::var_os("GEMINI_API_KEY").is_none() {
-        let fallback = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"));
-        if fallback.is_file() {
-            let _ = dotenvy::from_path(fallback);
-        }
-    }
+    let _ = crate::runtime_config::load_runtime_env();
 }
 
 /// 첫 번째 위치 인자가 `agy` 고유 서브커맨드인 경우 즉시 `exec`로 위임합니다.

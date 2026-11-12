@@ -1,7 +1,17 @@
 {
   "mcpServers": {
     "lab": {
-      "command": "~/.local/bin/agy-decision-mcp"
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "exec \"$1\" \"$@\"",
+        "sh",
+        "${PLUGIN_ROOT}/bin/agy-decision-mcp"
+      ],
+      "cwd": "${PLUGIN_ROOT}",
+      "env": {
+        "AGY_RULES_PATH": "${PLUGIN_ROOT}/data/default_rules.yaml"
+      }
     }
   }
 }

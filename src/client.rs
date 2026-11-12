@@ -36,12 +36,12 @@ struct ApiErrorDetail {
 
 impl DecisionClient {
     pub fn from_env() -> Result<Self> {
-        let _ = dotenvy::dotenv();
+        let _ = crate::runtime_config::load_runtime_env();
         let api_key = std::env::var("GEMINI_API_KEY")
             .ok()
             .filter(|v| !v.trim().is_empty() && v != "your_ai_studio_api_key_here")
             .context(
-                "GEMINI_API_KEY 환경변수가 설정되지 않았습니다 (.env 또는 프로세스 환경변수를 확인하세요)",
+                "GEMINI_API_KEY 환경변수가 설정되지 않았습니다 (~/.config/agy-decision-lab/config.env 또는 환경변수를 확인하세요)",
             )?;
 
         let endpoint = std::env::var("GEMINI_DECISIONS_ENDPOINT")

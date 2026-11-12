@@ -23,7 +23,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
+    let _ = agy_decision_lab::runtime_config::load_runtime_env();
     let cli = Cli::parse();
 
     let rule_set = RuleSet::load_from_path(&cli.rules_path)?;

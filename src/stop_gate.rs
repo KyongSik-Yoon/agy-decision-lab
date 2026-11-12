@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     client::DecisionClient,
     router::env_or,
-    rules::RuleSet,
     types::{
         Answer, DEFAULT_DECISION_MODEL, DEFAULT_DECISIONS_ENDPOINT, DecisionInput, DecisionRequest,
     },
@@ -97,13 +96,8 @@ pub async fn evaluate_stop_hook(
         return Ok(allow_fast("동일 세션 내 이미 검증 완료된 diff — 0ms 통과"));
     }
 
-    // 5. 규칙 로드 및 critical / high 핵심 규칙만 선별해 오탐 최소화
-    let resolved_rules_path = rules_path_override
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::var("AGY_RULES_PATH").ok().map(PathBuf::from))
-        .unwrap_or_else(default_rules_fallback_path);
-
-    let rule_set = RuleSet::load_from_path(&resolved_rules_path)?;
+    // 5. 규칙 로드(외부 파일 미존재 시 내장 규칙 자동 폴백) 및 critical / high 핵심 규칙만 선별해 오탐 최소화
+    let rule_set = crate::runtime_config::load_ruleset_with_fallback(rules_path_override)?;
     let (all_questions, rule_meta) = rule_set.build_questions(None);
 
     let mut high_impact_questions = BTreeMap::new();
@@ -119,7 +113,7 @@ pub async fn evaluate_stop_hook(
         return Ok(allow_fast("활성화된 critical/high 규칙 없음"));
     }
 
-    let _ = dotenvy::dotenv();
+    let _ = crate::runtime_config::load_runtime_env();
     let api_key = std::env::var("GEMINI_API_KEY")
         .ok()
         .filter(|v| !v.trim().is_empty() && v != "your_ai_studio_api_key_here")
@@ -275,15 +269,6 @@ fn hash_str(s: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
-}
-
-fn default_rules_fallback_path() -> PathBuf {
-    let candidate = PathBuf::from("rules/default_rules.yaml");
-    if candidate.is_file() {
-        candidate
-    } else {
-        PathBuf::from("rules/default_rules.yaml")
-    }
 }
 
 fn dedup_file_path() -> PathBuf {
