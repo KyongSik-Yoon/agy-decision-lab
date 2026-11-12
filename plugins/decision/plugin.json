@@ -1,0 +1,7 @@
+{
+  "name": "decision",
+  "version": "0.1.0",
+  "description": "Gemini Decision 1 (gemini-decision-1) PreToolUse 무소음 안전 검문소 및 다중 규칙 체크리스트 MCP 플러그인",
+  "author": "sam",
+  "logo": "assets/logo.svg"
+}

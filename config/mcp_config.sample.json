@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "agy-decision-lab": {
+      "command": "agy-decision-mcp",
+      "args": [],
+      "env": {
+        "GEMINI_API_KEY": "YOUR_PAID_TIER_AI_STUDIO_API_KEY",
+        "GEMINI_DECISION_MODEL": "gemini-decision-1",
+        "AGY_RULES_PATH": "~/.config/agy-decision-lab/rules/default_rules.yaml",
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

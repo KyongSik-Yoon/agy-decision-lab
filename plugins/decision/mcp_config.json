@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "lab": {
+      "command": "~/.local/bin/agy-decision-mcp"
+    }
+  }
+}

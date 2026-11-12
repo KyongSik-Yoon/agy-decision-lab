@@ -1,0 +1,50 @@
+[package]
+name = "agy-decision-lab"
+version = "0.1.0"
+edition = "2024"
+description = "Gemini Decisions API (gemini-decision-1) router, TUI hook & stdio MCP server for Antigravity CLI (agy)"
+license = "MIT"
+
+[lib]
+name = "agy_decision_lab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agy-route"
+path = "src/bin/agy_route.rs"
+
+[[bin]]
+name = "agy-acp"
+path = "src/bin/agy_acp.rs"
+
+[[bin]]
+name = "agy-decision-hook"
+path = "src/bin/agy_decision_hook.rs"
+
+[[bin]]
+name = "agy-decision-mcp"
+path = "src/bin/agy_decision_mcp.rs"
+
+[[bin]]
+name = "smoke-test"
+path = "src/bin/smoke_test.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = "0.29"
+dotenvy = "0.15"
+nu-ansi-term = "0.50"
+reedline = "0.53"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "3.8", features = ["server", "macros", "schemars", "transport-io"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+terminal-light = "1.9"
+termimad = "0.35"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "fs", "process", "signal", "sync", "time"] }
+unicode-width = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

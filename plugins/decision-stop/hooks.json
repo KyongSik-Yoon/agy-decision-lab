@@ -1,0 +1,12 @@
+{
+  "decision-stop-audit": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "~/.local/bin/agy-decision-hook",
+        "timeout": 6
+      }
+    ]
+  }
+}

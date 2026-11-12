@@ -1,0 +1,68 @@
+# Gemini Decisions API (noul) 다중 규칙 체크리스트
+# 작성 원칙: 모든 instructions는 긍정문("Does the input...")으로 작성하며, 응답 확률 범위는 0.01~0.99입니다.
+default_threshold: 0.72
+
+rules:
+  - id: hardcoded_credentials
+    category: security
+    severity: critical
+    threshold: 0.65
+    instructions: "Does the code or diff contain hardcoded API keys, passwords, private keys, tokens, or connection credentials?"
+    true_description: "Real-looking secret literals, tokens, private keys, or inline passwords exist in code or config."
+    false_description: "Secrets are loaded via environment variables, secret managers, or clearly marked dummy placeholders."
+
+  - id: injection_vulnerability
+    category: security
+    severity: critical
+    threshold: 0.70
+    instructions: "Does the code construct SQL queries, shell commands, or dynamic code execution strings using unsanitized external input?"
+    true_description: "String interpolation or concatenation passes untrusted input directly into SQL, shell, or eval sinks."
+    false_description: "Parameterized queries, argument arrays, or strict allowlist validation are used."
+
+  - id: sensitive_data_exposure
+    category: security
+    severity: high
+    threshold: 0.70
+    instructions: "Does the code log, print, or return sensitive personal data, raw authentication headers, or session tokens?"
+    true_description: "Logs, error messages, or responses expose raw tokens, passwords, or unmasked PII."
+    false_description: "Sensitive fields are redacted, omitted, or absent."
+
+  - id: destructive_fs_or_db_op
+    category: safety
+    severity: high
+    threshold: 0.70
+    instructions: "Does the code or script perform irreversible file deletion, directory wiping, or database table/data drops without safeguards?"
+    true_description: "Contains recursive delete, truncate, drop table, or force-overwrite operations on live paths."
+    false_description: "Read-only operations, scoped temp file cleanup, or reversible updates."
+
+  - id: unhandled_panic_or_error
+    category: reliability
+    severity: medium
+    threshold: 0.75
+    instructions: "Does production code ignore errors, swallow exceptions silently, or call panic/unwrap on fallible external inputs?"
+    true_description: "Non-test production code uses unchecked unwrap/expect on I/O or network inputs, or empty catch blocks."
+    false_description: "Errors are propagated, logged with context, or unwrap appears only inside unit tests."
+
+  - id: concurrency_or_lock_hazard
+    category: reliability
+    severity: high
+    threshold: 0.75
+    instructions: "Does the code hold synchronous locks across await points, risk deadlocks, or mutate shared state unsafely across threads?"
+    true_description: "Blocking locks or unsafe shared state mutations create race condition or deadlock risks."
+    false_description: "Thread-safe primitives, scoped lock guards, or single-threaded execution."
+
+  - id: unbounded_memory_or_io
+    category: performance
+    severity: medium
+    threshold: 0.75
+    instructions: "Does the code allocate unbounded collections, read arbitrarily large streams into memory at once, or run N+1 network/DB queries in a loop?"
+    true_description: "Missing pagination, missing size limits, or repeated blocking/network calls inside tight loops."
+    false_description: "Bounded buffers, streaming, batching, or small fixed-size inputs."
+
+  - id: breaking_contract_change
+    category: compatibility
+    severity: medium
+    threshold: 0.75
+    instructions: "Does the diff remove or incompatibly alter existing public API signatures, serialized field names, or CLI flags?"
+    true_description: "Public function signatures, JSON/YAML wire fields, or CLI options change incompatibly."
+    false_description: "Internal refactoring, additive optional fields, or backward-compatible changes."
