@@ -213,7 +213,7 @@ pub async fn evaluate_subagent_for_hook(
                 None,
             ));
         }
-        let monitor_model = targets.variant("flash", "low");
+        let monitor_model = targets.variant("hydrogen", "low");
         return Ok(SubagentRouteOutcome {
             kind: spec.kind,
             target_name: spec.target_name.clone(),
@@ -271,14 +271,19 @@ fn resolve_swarm_add_policy(
     let recommended_level = extract_effort_suffix(&summary.selected_model).unwrap_or("medium");
 
     // 1. 타 벤더(Claude / GPT 등) 교차 검증 모델이 명시된 경우 패밀리를 깨뜨리지 않고 보존하되,
-    //    추론 강도 접미사가 있는 모델(claude-*)은 필요 시 상향만 허용(강등 금지)
+    //    추론 강도 접미사가 있는 모델(claude-*)은 필요 시 상향만 허용(강등 금지, xhigh 미지원 모델은 high로 클램프)
     if preserve_cross_family
         && !spec.requested_model.is_empty()
         && is_external_vendor_model(&spec.requested_model, targets)
     {
         if let Some((ext_base, cur_eff)) = split_effort_model(&spec.requested_model) {
-            if effort_rank(recommended_level) > effort_rank(cur_eff) && summary.complexity_score >= 2.0 {
-                let upgraded = format!("{ext_base}-{recommended_level}");
+            let ext_target_level = if recommended_level == "xhigh" && !ModelTargets::supports_xhigh_slug(ext_base) {
+                "high"
+            } else {
+                recommended_level
+            };
+            if effort_rank(ext_target_level) > effort_rank(cur_eff) && summary.complexity_score >= 2.0 {
+                let upgraded = format!("{ext_base}-{ext_target_level}");
                 return SubagentRouteOutcome {
                     kind: spec.kind,
                     target_name: spec.target_name.clone(),
@@ -308,15 +313,21 @@ fn resolve_swarm_add_policy(
     let mut final_level = recommended_level.to_string();
     let mut guard_applied: Option<String> = None;
 
-    // 2. 작성자 워커 하한선(Author Floor): share / branch / fork 워커는 코드를 직접 수정하므로 Flash 강등 차단
-    if is_author_worker && final_family == "flash" {
-        final_family = "argon".to_string();
-        final_level = if summary.complexity_score < 1.35 {
-            "low".to_string()
-        } else {
-            "medium".to_string()
-        };
-        guard_applied = Some("author_floor_argon".to_string());
+    // 2. 작성자 워커 하한선(Author Floor): share / branch / fork 워커는 코드를 직접 수정하므로
+    //    3.8-flash 수동 설정 시 Argon 이상, 기본 Hydrogen 4는 최소 medium 이상만 허용
+    if is_author_worker && matches!(final_family.as_str(), "hydrogen" | "flash") {
+        if targets.hydrogen_base.to_ascii_lowercase().contains("flash") {
+            final_family = "argon".to_string();
+            final_level = if summary.complexity_score < 1.35 {
+                "low".to_string()
+            } else {
+                "medium".to_string()
+            };
+            guard_applied = Some("author_floor_no_flash".to_string());
+        } else if final_level == "low" {
+            final_level = "medium".to_string();
+            guard_applied = Some("author_floor_hydrogen_medium".to_string());
+        }
     }
 
     // 3. 명시적 Carbon 지정 시 보수적 강등 방지(High-Tier Guard):
@@ -379,12 +390,13 @@ fn resolve_invoke_subagent_policy(
 
     // invoke_subagent 허용 티어: "inherit" | "flash_lite" | "flash" | "pro"
     let mut target_tier = if is_research {
-        if summary.selected_family == "flash"
+        if matches!(summary.selected_family.as_str(), "hydrogen" | "flash")
             && summary.complexity_score < 0.45
             && summary.tier_confidence >= 0.82
         {
             "flash_lite"
-        } else if summary.selected_family == "flash"
+        } else if (matches!(summary.selected_family.as_str(), "hydrogen" | "flash")
+            && summary.complexity_score < 2.15)
             || (summary.selected_family == "argon" && summary.complexity_score < 1.90)
         {
             "flash"
@@ -397,19 +409,25 @@ fn resolve_invoke_subagent_policy(
     } else {
         // self 또는 커스텀 에이전트 (코드 작성·명령 실행 가능): flash_lite 절대 금지
         match summary.selected_family.as_str() {
-            "flash" => {
+            "hydrogen" | "flash" => {
                 if !is_mutating_ws
                     && summary.complexity_score < 1.05
                     && summary.tier_confidence >= 0.82
                 {
                     "flash"
+                } else if parent_tier == 1 {
+                    "inherit"
+                } else if parent_tier == 0 {
+                    guard_applied = Some("exec_subagent_floor".to_string());
+                    "pro"
+                } else if !is_mutating_ws
+                    && summary.tier_confidence >= 0.82
+                    && summary.complexity_score < 1.55
+                {
+                    "pro"
                 } else {
                     guard_applied = Some("exec_subagent_floor".to_string());
-                    if parent_tier == 0 {
-                        "pro"
-                    } else {
-                        "inherit"
-                    }
+                    "inherit"
                 }
             }
             "argon" => {
@@ -527,7 +545,10 @@ fn infer_parent_tier(model_name: &str) -> u8 {
     if lower.is_empty() {
         // 알 수 없을 때는 보수적으로 밸런스(1) 취급
         1
-    } else if lower.contains("flash") {
+    } else if lower.contains("flash")
+        || lower.contains("hydrogen-low")
+        || lower.contains("hydrogen (low)")
+    {
         0
     } else if lower.contains("carbon") || lower.contains("opus") {
         2
@@ -539,7 +560,7 @@ fn infer_parent_tier(model_name: &str) -> u8 {
 fn is_external_vendor_model(model: &str, targets: &ModelTargets) -> bool {
     let lower = model.trim().to_ascii_lowercase();
     let known_bases = [
-        targets.flash_base.to_ascii_lowercase(),
+        targets.hydrogen_base.to_ascii_lowercase(),
         targets.argon_base.to_ascii_lowercase(),
         targets.carbon_base.to_ascii_lowercase(),
     ];
@@ -550,7 +571,7 @@ fn is_external_vendor_model(model: &str, targets: &ModelTargets) -> bool {
 }
 
 fn split_effort_model(model: &str) -> Option<(&str, &str)> {
-    for eff in ["low", "medium", "high"] {
+    for eff in ["xhigh", "high", "medium", "low"] {
         let suffix = format!("-{eff}");
         if model.len() > suffix.len() && model.to_ascii_lowercase().ends_with(&suffix) {
             let split_at = model.len() - suffix.len();
@@ -562,12 +583,14 @@ fn split_effort_model(model: &str) -> Option<(&str, &str)> {
 
 fn extract_effort_suffix(model: &str) -> Option<&'static str> {
     let lower = model.to_ascii_lowercase();
-    if lower.ends_with("-low") {
-        Some("low")
-    } else if lower.ends_with("-medium") {
-        Some("medium")
+    if lower.ends_with("-xhigh") {
+        Some("xhigh")
     } else if lower.ends_with("-high") {
         Some("high")
+    } else if lower.ends_with("-medium") {
+        Some("medium")
+    } else if lower.ends_with("-low") {
+        Some("low")
     } else {
         None
     }
@@ -578,6 +601,7 @@ fn effort_rank(eff: &str) -> u8 {
         "low" => 1,
         "medium" => 2,
         "high" => 3,
+        "xhigh" => 4,
         _ => 2,
     }
 }
@@ -590,7 +614,7 @@ mod tests {
 
     fn default_targets() -> ModelTargets {
         ModelTargets {
-            flash_base: "gemini-3.8-flash".to_string(),
+            hydrogen_base: "gemini-4-hydrogen".to_string(),
             argon_base: "gemini-4-argon".to_string(),
             carbon_base: "gemini-4-carbon".to_string(),
         }
@@ -630,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn swarm_author_worker_never_drops_to_flash() {
+    fn swarm_author_worker_lifts_hydrogen_low_to_medium() {
         let args = serde_json::json!({
             "action": "add",
             "name": "author",
@@ -638,15 +662,40 @@ mod tests {
             "brief": "Update typo and add small helper in config.rs"
         });
         let spec = extract_subagent_call("swarm", &args, "Gemini 4 Carbon (Medium)").unwrap();
-        let summary = mock_summary("gemini-3.8-flash-low", "flash", "flash_quick", 0.6, 0.90);
+        let summary = mock_summary("gemini-4-hydrogen-low", "hydrogen", "hydrogen_quick", 0.6, 0.90);
         let out = resolve_subagent_policy(&spec, summary, &default_targets());
         assert!(out.rewritten);
-        assert_eq!(out.selected_model, "gemini-4-argon-low");
-        assert_eq!(out.guard_applied.as_deref(), Some("author_floor_argon"));
+        assert_eq!(out.selected_model, "gemini-4-hydrogen-medium");
+        assert_eq!(
+            out.guard_applied.as_deref(),
+            Some("author_floor_hydrogen_medium")
+        );
     }
 
     #[test]
-    fn swarm_cross_family_claude_reviewer_is_preserved_and_upgraded_if_complex() {
+    fn swarm_author_worker_allows_hydrogen_high_and_xhigh() {
+        let args = serde_json::json!({
+            "action": "add",
+            "name": "author",
+            "workspace": "share",
+            "brief": "Implement retry backoff and unit tests in client.rs"
+        });
+        let spec = extract_subagent_call("swarm", &args, "Gemini 4 Carbon (Medium)").unwrap();
+
+        let sum_high = mock_summary("gemini-4-hydrogen-high", "hydrogen", "hydrogen_exec", 1.8, 0.90);
+        let out_high = resolve_subagent_policy(&spec, sum_high, &default_targets());
+        assert_eq!(out_high.selected_model, "gemini-4-hydrogen-high");
+        assert!(out_high.guard_applied.is_none());
+
+        let sum_xhigh =
+            mock_summary("gemini-4-hydrogen-xhigh", "hydrogen", "hydrogen_exec", 2.4, 0.90);
+        let out_xhigh = resolve_subagent_policy(&spec, sum_xhigh, &default_targets());
+        assert_eq!(out_xhigh.selected_model, "gemini-4-hydrogen-xhigh");
+        assert!(out_xhigh.guard_applied.is_none());
+    }
+
+    #[test]
+    fn swarm_cross_family_claude_reviewer_is_preserved_and_clamped_from_xhigh_to_high() {
         let args = serde_json::json!({
             "action": "add",
             "name": "reviewer",
@@ -656,10 +705,10 @@ mod tests {
         });
         let spec = extract_subagent_call("generic", &args, "Gemini 4 Carbon (Medium)").unwrap();
         let summary = mock_summary(
-            "gemini-4-carbon-high",
-            "carbon",
-            "carbon_frontier",
-            3.4,
+            "gemini-4-hydrogen-xhigh",
+            "hydrogen",
+            "hydrogen_exec",
+            2.6,
             0.91,
         );
         let out = resolve_subagent_policy(&spec, summary, &default_targets());
@@ -676,7 +725,13 @@ mod tests {
         });
         let spec =
             extract_subagent_call("invoke_subagent", &args, "Gemini 4 Carbon (High)").unwrap();
-        let summary = mock_summary("gemini-3.8-flash-medium", "flash", "flash_quick", 0.85, 0.88);
+        let summary = mock_summary(
+            "gemini-4-hydrogen-medium",
+            "hydrogen",
+            "hydrogen_quick",
+            0.85,
+            0.88,
+        );
         let out = resolve_subagent_policy(&spec, summary, &default_targets());
         assert!(out.rewritten);
         assert_eq!(out.model_arg_key, "Model");
@@ -706,14 +761,14 @@ mod tests {
     }
 
     #[test]
-    fn invoke_subagent_self_on_flash_parent_upgrades_to_pro() {
+    fn invoke_subagent_self_on_hydrogen_low_parent_upgrades_to_pro() {
         let args = serde_json::json!({
             "TypeName": "self",
             "Role": "Feature Builder",
             "Prompt": "Implement retry backoff and unit tests for client.rs"
         });
         let spec =
-            extract_subagent_call("invoke_subagent", &args, "Gemini 3.8 Flash (Low)").unwrap();
+            extract_subagent_call("invoke_subagent", &args, "Gemini 4 Hydrogen (Low)").unwrap();
         let summary = mock_summary("gemini-4-argon-medium", "argon", "argon_feature", 1.7, 0.85);
         let out = resolve_subagent_policy(&spec, summary, &default_targets());
         assert!(out.rewritten);

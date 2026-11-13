@@ -38,7 +38,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 const ROUTE_HISTORY_FILE: &str = "repl_history.txt";
 
-/// Gemini Decision 1 기반 Antigravity CLI(agy) 9단계 스펙트럼 동적 라우터 (Flash 3.8 / Argon 4 / Carbon 4)
+/// Gemini Decision 1 기반 Antigravity CLI(agy) 10단계 스펙트럼 동적 라우터 (Hydrogen 4 / Argon 4 / Carbon 4)
 #[derive(Debug, Parser)]
 #[command(name = "agy-route", version, about)]
 struct Cli {

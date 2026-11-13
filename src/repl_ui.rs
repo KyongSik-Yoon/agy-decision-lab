@@ -386,12 +386,12 @@ pub fn maybe_exec_native_subcommand(agy_bin: &str) -> Result<()> {
 pub fn resolve_targets(preset: Option<&str>) -> ModelTargets {
     match preset.map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("no-carbon" | "argon") => ModelTargets {
-            flash_base: "gemini-3.8-flash".to_string(),
+            hydrogen_base: "gemini-4-hydrogen".to_string(),
             argon_base: "gemini-4-argon".to_string(),
             carbon_base: "gemini-4-argon".to_string(),
         },
         Some("claude") => ModelTargets {
-            flash_base: "gemini-3.8-flash".to_string(),
+            hydrogen_base: "gemini-4-hydrogen".to_string(),
             argon_base: "claude-sonnet-5-5".to_string(),
             carbon_base: "claude-opus-5-5".to_string(),
         },
@@ -406,23 +406,33 @@ pub fn apply_effort_override(model: &str, effort_override: Option<&str>) -> (Str
         return (model.to_string(), cli_eff);
     };
 
+    let base = model
+        .strip_suffix("-xhigh")
+        .or_else(|| model.strip_suffix("-low"))
+        .or_else(|| model.strip_suffix("-medium"))
+        .or_else(|| model.strip_suffix("-high"))
+        .unwrap_or(model);
+
     if matches!(eff, "low" | "medium" | "high") && model_has_baked_effort(model) {
-        let base = model
-            .strip_suffix("-low")
-            .or_else(|| model.strip_suffix("-medium"))
-            .or_else(|| model.strip_suffix("-high"))
-            .unwrap_or(model);
         return (format!("{base}-{eff}"), None);
     }
 
-    // xhigh / max 등 확장 effort가 지정되었을 때 baked 모델이면 모델명은 -high 변형으로 맞추고 플래그도 함께 반환
-    if matches!(eff, "xhigh" | "max") && model_has_baked_effort(model) {
-        let base = model
-            .strip_suffix("-low")
-            .or_else(|| model.strip_suffix("-medium"))
-            .or_else(|| model.strip_suffix("-high"))
-            .unwrap_or(model);
-        return (format!("{base}-high"), Some(eff.to_string()));
+    // xhigh 지정 시 Hydrogen처럼 네이티브 -xhigh 슬러그가 있으면 플래그 없이 직접 결합하고, 아니면 -high + --effort xhigh 전달
+    if eff == "xhigh" && model_has_baked_effort(model) {
+        if ModelTargets::supports_xhigh_slug(base) {
+            return (format!("{base}-xhigh"), None);
+        }
+        return (format!("{base}-high"), Some("xhigh".to_string()));
+    }
+
+    // max 등 상위 effort가 지정된 경우 xhigh 지원 패밀리는 -xhigh, 그 외는 -high 모델 + --effort 전달
+    if eff == "max" && model_has_baked_effort(model) {
+        let top = if ModelTargets::supports_xhigh_slug(base) {
+            "xhigh"
+        } else {
+            "high"
+        };
+        return (format!("{base}-{top}"), Some("max".to_string()));
     }
 
     (model.to_string(), Some(eff.to_string()))
@@ -645,7 +655,7 @@ pub fn print_repl_banner(state: &SharedReplState, subtitle_prefix: &str) {
         Some(m) => format!("주력 모델=\x1b[1m{m}\x1b[0m (자동 전환: `/model auto`)"),
         None => format!(
             "자동 라우터={}-* / {}-* / {}-*",
-            state.targets.flash_base, state.targets.argon_base, state.targets.carbon_base
+            state.targets.hydrogen_base, state.targets.argon_base, state.targets.carbon_base
         ),
     };
 
@@ -811,13 +821,13 @@ pub fn dispatch_common_slash_command(
         "/preset" => {
             if arg_rest.is_empty() {
                 eprintln!(
-                    "사용 가능한 프리셋: spectrum (Flash+Argon+Carbon 전체 순환), no-carbon (Flash+Argon만 사용), claude (Flash+Sonnet+Opus)"
+                    "사용 가능한 프리셋: spectrum (Hydrogen+Argon+Carbon 전체 순환), no-carbon (Hydrogen+Argon만 사용), claude (Hydrogen+Sonnet+Opus)"
                 );
             } else {
                 state.targets = resolve_targets(Some(arg_rest));
                 eprintln!(
                     "{accent}[{tag}]\x1b[0m 프리셋 변경됨 ({arg_rest}): {}-* / {}-* / {}-*",
-                    state.targets.flash_base, state.targets.argon_base, state.targets.carbon_base
+                    state.targets.hydrogen_base, state.targets.argon_base, state.targets.carbon_base
                 );
             }
             Ok(CommonSlashAction::Handled)
@@ -908,7 +918,9 @@ pub fn print_help_menu(flavor: ThemeFlavor) {
     eprintln!("  /tui                현재 대화를 그대로 순정 agy 풀스크린 TUI로 전환");
     eprintln!();
     eprintln!("{accent}  [모델 및 라우팅 제어]\x1b[0m");
-    eprintln!("  /model [모델|auto]   특정 모델로 수동 고정하거나 auto(9단계 동적 라우팅)로 복귀");
+    eprintln!(
+        "  /model [모델|auto]   특정 모델로 수동 고정하거나 auto(10단계 동적 라우팅)로 복귀"
+    );
     eprintln!("  /effort [수준|auto]  추론 깊이(low|medium|high|xhigh|max) 고정 또는 auto 복귀");
     eprintln!("  /preset <이름>       spectrum (기본) | no-carbon | claude 패밀리 프리셋 변경");
     eprintln!();
@@ -928,7 +940,7 @@ pub fn print_common_status(state: &SharedReplState, active_server_model: Option<
         .pinned_model
         .as_deref()
         .map(|m| format!("고정({m})"))
-        .unwrap_or_else(|| "자동(9단계 스펙트럼)".to_string());
+        .unwrap_or_else(|| "자동(10단계 스펙트럼)".to_string());
     let effort_mode = state.pinned_effort.as_deref().unwrap_or("자동");
     let model_label = active_server_model.unwrap_or(&state.last_model);
 
@@ -967,7 +979,7 @@ pub fn print_common_status(state: &SharedReplState, active_server_model: Option<
     eprintln!(
         "{muted}  테마: {} | 패밀리: {}/{}/{} | 편집모드: {}\x1b[0m",
         state.active_flavor.as_str(),
-        state.targets.flash_base,
+        state.targets.hydrogen_base,
         state.targets.argon_base,
         state.targets.carbon_base,
         state.current_edit_mode
@@ -1748,14 +1760,14 @@ pub fn handle_model_command(arg: &str, state: &mut SharedReplState) {
         let mode_str = match &state.pinned_model {
             Some(m) => format!("수동 고정 (\x1b[1m{m}\x1b[0m)"),
             None => format!(
-                "9단계 자동 라우팅 ({}-* / {}-* / {}-*)",
-                state.targets.flash_base, state.targets.argon_base, state.targets.carbon_base
+                "10단계 자동 라우팅 ({}-* / {}-* / {}-*)",
+                state.targets.hydrogen_base, state.targets.argon_base, state.targets.carbon_base
             ),
         };
         eprintln!("{accent}[{tag}]\x1b[0m 현재 모델 설정: {mode_str}");
         eprintln!("{muted}  사용법: /model auto (자동 라우팅 복귀) | /model <모델명 또는 약어>\x1b[0m");
         eprintln!(
-            "{muted}  약어 예시: flash-low, flash-medium, flash-high, argon-low, argon-medium, argon-high, carbon-low, carbon-medium, carbon-high, sonnet, opus\x1b[0m"
+            "{muted}  약어 예시: hydrogen-low, hydrogen-medium, hydrogen-high, hydrogen-xhigh, argon-low, argon-medium, argon-high, carbon-low, carbon-medium, carbon-high, sonnet, opus\x1b[0m"
         );
         return;
     }
@@ -1764,15 +1776,17 @@ pub fn handle_model_command(arg: &str, state: &mut SharedReplState) {
     if matches!(lower.as_str(), "auto" | "reset" | "dynamic" | "default") {
         state.pinned_model = None;
         eprintln!(
-            "{accent}[{tag}]\x1b[0m 모델 고정이 해제되었습니다 -> 9단계 스펙트럼 자동 라우팅으로 동작합니다."
+            "{accent}[{tag}]\x1b[0m 모델 고정이 해제되었습니다 -> 10단계 스펙트럼 자동 라우팅으로 동작합니다."
         );
         return;
     }
 
     let resolved = match lower.as_str() {
-        "flash" | "flash-medium" => state.targets.variant("flash", "medium"),
-        "flash-low" => state.targets.variant("flash", "low"),
-        "flash-high" => state.targets.variant("flash", "high"),
+        "hydrogen" | "hydrogen-high" => state.targets.variant("hydrogen", "high"),
+        "hydrogen-low" | "flash-low" => state.targets.variant("hydrogen", "low"),
+        "hydrogen-medium" | "flash" | "flash-medium" => state.targets.variant("hydrogen", "medium"),
+        "hydrogen-xhigh" | "flash-xhigh" => state.targets.variant("hydrogen", "xhigh"),
+        "flash-high" => state.targets.variant("hydrogen", "high"),
         "argon" | "argon-medium" => state.targets.variant("argon", "medium"),
         "argon-low" => state.targets.variant("argon", "low"),
         "argon-high" => state.targets.variant("argon", "high"),

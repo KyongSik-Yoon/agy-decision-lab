@@ -53,7 +53,7 @@ enum HookCmd {
     /// 샘플 프롬프트로 PreInvocation 라우팅 훅 JSON 출력 시뮬레이션
     Test {
         prompt: String,
-        #[arg(long, default_value = "Gemini 3.8 Flash (Low)")]
+        #[arg(long, default_value = "Gemini 4 Hydrogen (Low)")]
         current_model: String,
     },
     /// 샘플 셸 명령으로 PreToolUse 안전 검문소 판정 시뮬레이션
@@ -357,8 +357,10 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
             let ctx = StopHookContext {
                 conversation_id: String::new(),
                 cwd: resolved_cwd,
+                transcript_path: String::new(),
                 termination_reason: "NO_TOOL_CALL".to_string(),
                 continuation_active: false,
+                fully_idle: true,
                 execution_num: 0,
             };
             let eval = evaluate_stop_hook(&ctx, None, false, Duration::from_millis(4800)).await?;
@@ -442,8 +444,10 @@ async fn evaluate_stop_envelope(envelope: &GenericHookEnvelope) -> serde_json::V
     let ctx = StopHookContext {
         conversation_id: envelope.conversation_id.clone(),
         cwd: envelope.cwd.clone(),
+        transcript_path: String::new(),
         termination_reason: envelope.termination_reason.clone(),
         continuation_active: envelope.continuation_active,
+        fully_idle: true,
         execution_num: envelope.execution_num,
     };
 
@@ -641,7 +645,7 @@ async fn evaluate_pre_invocation(
 
     let current_tier = infer_active_model_tier(&payload.model_name);
     let recommended_tier = match summary.selected_family.as_str() {
-        "flash" => 0,
+        "hydrogen" | "flash" => 0,
         "argon" => 1,
         _ => 2,
     };
@@ -672,12 +676,15 @@ async fn evaluate_pre_invocation(
 
 fn infer_active_model_tier(model_name: &str) -> u8 {
     let lower = model_name.to_ascii_lowercase();
-    if lower.contains("flash") {
+    if lower.contains("flash")
+        || lower.contains("hydrogen-low")
+        || lower.contains("hydrogen (low)")
+    {
         0
     } else if lower.contains("carbon") || lower.contains("opus") {
         2
     } else {
-        // Argon, Sonnet 등 밸런스 주력 모델
+        // Hydrogen Medium/High/XHigh, Argon, Sonnet 등 코딩 주력 모델
         1
     }
 }
@@ -757,6 +764,8 @@ fn split_model_for_statusline(
 
     let fam_rank: u32 = if base.contains("flash") || base.contains("haiku") {
         10
+    } else if base.contains("hydrogen") {
+        15
     } else if base.contains("carbon") || base.contains("opus") || base.contains("pro") {
         30
     } else {

@@ -8,13 +8,13 @@ description: Gemini Decision 1을 이용해 서브에이전트(invoke_subagent) 
 ## 1. 동작 원리 (프롬프트 캐시 100% 보존 + 추가 턴 0회)
 
 - `PreToolUse` 훅이 `invoke_subagent` 및 `swarm`(`action: "add"`) 호출 직전에 `Prompt` / `brief`를 읽어 `gemini-decision-1`(단일 패스 약 200~250ms)로 작업 티어와 추론 깊이를 판별한 뒤 `overwrite`로 모델 인자를 주입한다.
-- **`swarm` (`action: "add"`)**: `gemini-3.8-flash-{low,medium,high}`, `gemini-4-argon-{low,medium,high}`, `gemini-4-carbon-{low,medium,high}` 9단계 슬러그로 **모델과 추론 강도(`effort`)를 동시에 세팅**한다.
+- **`swarm` (`action: "add"`)**: `gemini-4-hydrogen-{low,medium,high,xhigh}`, `gemini-4-argon-{low,medium,high}`, `gemini-4-carbon-{low,medium,high}` Gemini 4 10단계 슬러그로 **모델과 추론 강도(`effort`)를 동시에 세팅**한다(`swarm_monitor`는 API 호출 없이 즉시 `gemini-4-hydrogen-low` 할당).
 - **`invoke_subagent`**: 스키마가 허용하는 `flash_lite` / `flash` / `pro` / `inherit` 4단계 티어로 매핑한다.
 
 ## 2. 성능 저하 방지 안전장치
 
-- **작성자 하한선(`author_floor_argon`)**: 코드를 수정하는 워커(`workspace: "share" | "branch"` 또는 `fork` 지정)는 절대 `flash`로 강등되지 않고 최소 `gemini-4-argon-low/medium` 이상을 보장한다.
-- **타 패밀리 교차 검증 보존(`preserve_cross_family`)**: `claude-*` / `gpt-*` 모델을 명시한 스웜 워커는 패밀리를 유지하며, `claude-*`에서 복잡도가 높을 때만 추론 강도(`-medium`/`-high`)를 상향한다.
+- **작성자 하한선(`author_floor_hydrogen_medium`)**: 코드를 수정하는 워커(`workspace: "share" | "branch"` 또는 `fork` 지정)는 `hydrogen-low`로 내려가지 않고 최소 `gemini-4-hydrogen-medium` 이상(`hydrogen-medium/high/xhigh`, `argon`, `carbon`)만 허용한다.
+- **타 패밀리 교차 검증 보존(`preserve_cross_family`)**: `claude-*` / `gpt-*` 모델을 명시한 스웜 워커는 패밀리를 유지하며, `claude-*`에서 복잡도가 높을 때만 추론 강도(`-medium`/`-high`, `-xhigh` 미지원 시 `-high` 클램프)를 상향한다.
 - **Fail-Open**: API 지연·오류 시 차단 없이 원래 호출 인자 그대로 즉시 통과한다.
 
 ## 3. 즉시 제어·시뮬레이션·원복 명령

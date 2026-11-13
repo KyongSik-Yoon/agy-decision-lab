@@ -1510,7 +1510,7 @@ for raw in sys.stdin:
     if method == "initialize":
         res = {"protocolVersion": 1}
     elif method == "session/new":
-        res = {"sessionId": "sess-init-123", "models": {"currentModelId": "gemini-3.8-flash-low"}}
+        res = {"sessionId": "sess-init-123", "models": {"currentModelId": "gemini-4-hydrogen-low"}}
     elif method == "session/resume":
         res = {"sessionId": msg["params"]["sessionId"]}
     else:
