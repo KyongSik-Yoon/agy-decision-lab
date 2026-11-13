@@ -9,7 +9,7 @@ rules:
     threshold: 0.65
     instructions: "Does the code or diff contain hardcoded API keys, passwords, private keys, tokens, or connection credentials?"
     true_description: "Real-looking secret literals, tokens, private keys, or inline passwords exist in code or config."
-    false_description: "Secrets are loaded via environment variables, secret managers, or clearly marked dummy placeholders."
+    false_description: "Secrets are loaded via environment variables, secret managers, or clearly marked dummy/test-only placeholders in test files (*Test.*, *Spec.*, tests/)."
 
   - id: injection_vulnerability
     category: security
@@ -31,9 +31,9 @@ rules:
     category: safety
     severity: high
     threshold: 0.70
-    instructions: "Does the code or script perform irreversible file deletion, directory wiping, or database table/data drops without safeguards?"
-    true_description: "Contains recursive delete, truncate, drop table, or force-overwrite operations on live paths."
-    false_description: "Read-only operations, scoped temp file cleanup, or reversible updates."
+    instructions: "Does non-test production code or operational script perform irreversible file deletion, directory wiping, or database table/data drops on live targets without safeguards?"
+    true_description: "Production code or operational script runs unguarded rm -rf, truncate, drop table/database, or force-overwrite on live user or production paths/databases."
+    false_description: "Read-only operations, scoped temp/cache/build directory cleanup ($TMPDIR, mktemp, .tmp), or isolated test fixtures/teardowns inside test files (src/test/, *Test.*, *Spec.*, tests/)."
 
   - id: unhandled_panic_or_error
     category: reliability

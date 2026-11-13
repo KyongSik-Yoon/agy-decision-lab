@@ -1,7 +1,7 @@
 {
   "name": "decision-stop",
-  "version": "0.1.0",
-  "description": "Gemini Decision 1 기반 Stop 완료 체크리스트 검증기 (코드 diff가 있는 턴 종료 시에만 critical/high 보안·안전 규칙 자동 스캔)",
+  "version": "0.2.0",
+  "description": "Gemini Decision 1 기반 Stop 완료 체크리스트 검증기 (백그라운드 대기·읽기 전용 턴 0ms 패스스루 및 파일별 증분 diff 스캔)",
   "author": "sam",
   "logo": "assets/logo.svg"
 }

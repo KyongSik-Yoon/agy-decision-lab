@@ -102,13 +102,21 @@ struct GenericHookEnvelope {
     #[serde(default)]
     cwd: String,
     #[serde(default)]
+    transcript_path: String,
+    #[serde(default)]
     tool_call: Option<ToolCallPayload>,
     #[serde(default)]
     termination_reason: String,
     #[serde(default)]
     continuation_active: bool,
+    #[serde(default = "default_fully_idle")]
+    fully_idle: bool,
     #[serde(default)]
     execution_num: u64,
+}
+
+fn default_fully_idle() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,9 +284,11 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
                 model_name: current_model,
                 last_user_input: prompt,
                 cwd: String::new(),
+                transcript_path: String::new(),
                 tool_call: None,
                 termination_reason: String::new(),
                 continuation_active: false,
+                fully_idle: true,
                 execution_num: 0,
             };
             let out = evaluate_pre_invocation(&env, false).await?;
@@ -444,10 +454,10 @@ async fn evaluate_stop_envelope(envelope: &GenericHookEnvelope) -> serde_json::V
     let ctx = StopHookContext {
         conversation_id: envelope.conversation_id.clone(),
         cwd: envelope.cwd.clone(),
-        transcript_path: String::new(),
+        transcript_path: envelope.transcript_path.clone(),
         termination_reason: envelope.termination_reason.clone(),
         continuation_active: envelope.continuation_active,
-        fully_idle: true,
+        fully_idle: envelope.fully_idle,
         execution_num: envelope.execution_num,
     };
 
