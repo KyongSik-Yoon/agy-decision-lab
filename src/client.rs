@@ -8,12 +8,22 @@ use crate::types::{
     DEFAULT_DECISION_MODEL, DEFAULT_DECISIONS_ENDPOINT, DecisionRequest, DecisionResponse,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DecisionClient {
     http: Client,
     api_key: String,
     endpoint: String,
     default_model: String,
+}
+
+impl std::fmt::Debug for DecisionClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionClient")
+            .field("endpoint", &self.endpoint)
+            .field("default_model", &self.default_model)
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,5 +133,24 @@ impl DecisionClient {
             response: parsed,
             latency_ms,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_impl_redacts_api_key() {
+        let client = DecisionClient::new(
+            "AIzaSyDummySecretKey123",
+            "https://example.invalid/v1beta/decisions",
+            "gemini-decision-1",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let dbg = format!("{client:?}");
+        assert!(!dbg.contains("AIzaSyDummySecretKey123"));
+        assert!(dbg.contains("[REDACTED]"));
     }
 }

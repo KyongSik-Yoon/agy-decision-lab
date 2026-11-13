@@ -3,7 +3,8 @@ set -euo pipefail
 
 export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PLUGIN_LINK="$HOME/.gemini/config/plugins/decision-subagent"
 STATE_DIR="$HOME/.local/state/agy-decision-lab"
 BACKUP_BIN="$STATE_DIR/backups/agy-decision-hook.baseline"

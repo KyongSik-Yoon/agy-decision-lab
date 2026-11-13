@@ -325,6 +325,10 @@ impl DecisionMcpServer {
         let input = if let Some(path_str) = args.local_file_path.as_deref()
             && !path_str.trim().is_empty()
         {
+            anyhow::ensure!(
+                is_allowed_media_path(path_str),
+                "허용되지 않은 첨부 파일 확장자입니다 (.pdf, .png, .jpg, .jpeg, .webp, .gif만 허용): {path_str}"
+            );
             let bytes = tokio::fs::read(path_str)
                 .await
                 .with_context(|| format!("로컬 파일 읽기 실패: {path_str}"))?;
@@ -371,6 +375,13 @@ impl DecisionMcpServer {
             "usage": outcome.response.usage,
         }))
     }
+}
+
+fn is_allowed_media_path(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
 }
 
 fn guess_mime_type(path: &str) -> &'static str {

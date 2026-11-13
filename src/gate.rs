@@ -32,17 +32,28 @@ pub fn is_zero_ms_safe_command(cmd: &str) -> bool {
         return false;
     }
 
-    // 파이프, 체이닝, 리다이렉션, 명령 치환, 백그라운드, 줄바꿈 포함 시 정밀 채점으로 넘김
-    let forbidden_chars = [';', '&', '|', '>', '<', '`', '\n', '\r'];
-    if trimmed.chars().any(|c| forbidden_chars.contains(&c)) || trimmed.contains("$(") {
+    // 파이프, 체이닝, 리다이렉션, 명령 치환, 글롭, 변수 확장, 홈 확장, 이스케이프 포함 시 정밀 채점으로 넘김
+    let forbidden_chars = [
+        ';', '&', '|', '>', '<', '`', '\n', '\r', '*', '?', '[', ']', '$', '~', '\\', '{', '}',
+    ];
+    if trimmed.chars().any(|c| forbidden_chars.contains(&c)) {
         return false;
     }
 
-    // 민감 경로 키워드가 인자에 포함되면 정밀 채점으로 넘김
+    // 민감 경로·시크릿 키워드·키 프리픽스가 인자에 포함되면 정밀 채점으로 넘김
     let lower = trimmed.to_ascii_lowercase();
     let sensitive_tokens = [
         ".env",
         ".ssh",
+        ".aws",
+        ".kube",
+        ".gnupg",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".docker",
+        ".git-credentials",
+        "config.env",
         "id_rsa",
         "id_ed25519",
         "shadow",
@@ -52,6 +63,15 @@ pub fn is_zero_ms_safe_command(cmd: &str) -> bool {
         "credential",
         "apikey",
         "api_key",
+        "private_key",
+        "private key",
+        "aiza",
+        "ghp_",
+        "glpat-",
+        "xoxb-",
+        "sk-",
+        "/etc/passwd",
+        "/etc/gshadow",
     ];
     if sensitive_tokens.iter().any(|tok| lower.contains(tok)) {
         return false;
@@ -63,14 +83,34 @@ pub fn is_zero_ms_safe_command(cmd: &str) -> bool {
     };
     let bin = first.rsplit('/').next().unwrap_or(first);
 
+    let has_external_or_parent_path = |args: &[&str]| -> bool {
+        args.iter().any(|arg| {
+            let unquoted = arg.trim_matches(|c| c == '\'' || c == '"');
+            let val = if unquoted.starts_with('-') {
+                unquoted.split_once('=').map(|(_, v)| v).unwrap_or("")
+            } else {
+                unquoted
+            };
+            val.starts_with('/')
+                || val == ".."
+                || val.starts_with("../")
+                || val.ends_with("/..")
+                || val.contains("/../")
+        })
+    };
+
     match bin {
         "pwd" | "whoami" | "uname" | "date" | "uptime" | "df" | "free" | "ls" | "ll" | "tree"
         | "wc" | "stat" | "file" | "which" | "type" | "realpath" | "dirname" | "basename" => true,
-        "cat" | "head" | "tail" | "bat" | "less" => true,
-        "rg" | "grep" | "fd" | "jq" => true,
-        "find" => !parts
-            .iter()
-            .any(|p| matches!(*p, "-delete" | "-exec" | "-execdir" | "-ok" | "-fprint")),
+        "cat" | "head" | "tail" | "bat" | "less" | "rg" | "grep" | "fd" | "jq" => {
+            !has_external_or_parent_path(&parts[1..])
+        }
+        "find" => {
+            !has_external_or_parent_path(&parts[1..])
+                && !parts
+                    .iter()
+                    .any(|p| matches!(*p, "-delete" | "-exec" | "-execdir" | "-ok" | "-fprint"))
+        }
         "git" => match parts.get(1).copied() {
             Some("status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "blame") => true,
             Some("branch") => !parts
@@ -79,13 +119,67 @@ pub fn is_zero_ms_safe_command(cmd: &str) -> bool {
                 .any(|p| matches!(*p, "-d" | "-D" | "-m" | "-M" | "--delete")),
             _ => false,
         },
-        "cargo" => matches!(
-            parts.get(1).copied(),
-            Some("check" | "clippy" | "fmt" | "test" | "build" | "metadata" | "tree" | "--version" | "-V")
-        ),
+        "cargo" => {
+            let sub_ok = matches!(
+                parts.get(1).copied(),
+                Some(
+                    "check"
+                        | "clippy"
+                        | "fmt"
+                        | "test"
+                        | "build"
+                        | "metadata"
+                        | "tree"
+                        | "--version"
+                        | "-V"
+                )
+            );
+            sub_ok
+                && !parts[1..]
+                    .iter()
+                    .any(|p| *p == "--config" || p.starts_with("--config="))
+                && !has_external_or_parent_path(&parts[1..])
+        }
         "rustc" | "rustup" => parts.get(1).copied() == Some("--version"),
         _ => false,
     }
+}
+
+fn check_protected_credential_store(command: &str) -> Option<GateEvaluation> {
+    let normalized = command.to_ascii_lowercase();
+    let trimmed = normalized.trim_start();
+
+    if trimmed.starts_with("agy-decision-hook status") {
+        return None;
+    }
+
+    let without_rules = normalized.replace(".config/agy-decision-lab/rules", "");
+    let touches_non_rules_config = without_rules.contains(".config/agy-decision-lab");
+
+    let protected_patterns = [
+        "config.env",
+        ".ssh/id_",
+        ".aws/credentials",
+        ".netrc",
+        ".git-credentials",
+        "/etc/shadow",
+        "/etc/gshadow",
+    ];
+
+    if touches_non_rules_config || protected_patterns.iter().any(|p| normalized.contains(p)) {
+        return Some(GateEvaluation {
+            action: "force_ask".to_string(),
+            fast_path: true,
+            reason: "민감 인증·자격 증명 저장소 접근 감지 (로컬 강제 확인)".to_string(),
+            risk_score: 2.5,
+            risk_confidence: 1.0,
+            destructive_probability: 0.0,
+            secret_exposure_probability: 1.0,
+            latency_ms: 0,
+        });
+    }
+
+    None
 }
 
 pub async fn evaluate_command_for_hook(
@@ -104,6 +198,10 @@ pub async fn evaluate_command_for_hook(
             secret_exposure_probability: 0.0,
             latency_ms: 0,
         });
+    }
+
+    if let Some(blocked) = check_protected_credential_store(command) {
+        return Ok(blocked);
     }
 
     let _ = crate::runtime_config::load_runtime_env();
@@ -154,7 +252,10 @@ pub async fn evaluate_command_for_hook(
         "exposes_secrets".to_string(),
         Question::Noul {
             instructions: "Does this command read, print, or transmit secret keys, tokens, .env credentials, or private authentication files over stdout or network?".to_string(),
-            criteria: None,
+            criteria: Some(NoulCriteria {
+                true_description: "Reads, dumps, greps, or transmits .env/config.env files, SSH/GPG/cloud/Kubernetes credentials, auth tokens, API keys, or wildcard dumps of ~/.config, ~/.ssh, ~/.aws, or secret directories.".to_string(),
+                false_description: "Inspects ordinary project source code, build outputs, tests, or non-sensitive workspace files.".to_string(),
+            }),
         },
     );
 
@@ -220,7 +321,7 @@ pub fn decide_hook_gate_action(
     // 비가역 변경·외부 발신·시크릿 접근 의심 시 always-proceed 상태에서도 사용자 확인창 강제(force_ask)
     if risk_score >= 2.00
         || destructive_prob >= 0.55
-        || secret_prob >= 0.50
+        || secret_prob >= 0.40
         || (risk_score >= 1.65 && risk_conf < 0.60)
     {
         return (
@@ -254,6 +355,11 @@ mod tests {
         assert!(is_zero_ms_safe_command("rg DecisionClient src/"));
 
         assert!(!is_zero_ms_safe_command("cat .env"));
+        assert!(!is_zero_ms_safe_command("cat ~/.config/agy-decision-lab/*"));
+        assert!(!is_zero_ms_safe_command("cat /etc/passwd"));
+        assert!(!is_zero_ms_safe_command("cat ../secret.txt"));
+        assert!(!is_zero_ms_safe_command("rg AIza src/"));
+        assert!(!is_zero_ms_safe_command("cat $HOME/config"));
         assert!(!is_zero_ms_safe_command("git status && rm -rf target"));
         assert!(!is_zero_ms_safe_command("find . -name '*.tmp' -delete"));
         assert!(!is_zero_ms_safe_command("git push --force origin main"));
@@ -270,7 +376,33 @@ mod tests {
         let (act2, _) = decide_hook_gate_action(2.1, 0.88, 0.65, 0.05, 250);
         assert_eq!(act2, "force_ask");
 
+        let (act_secret, _) = decide_hook_gate_action(1.02, 0.57, 0.05, 0.41, 240);
+        assert_eq!(act_secret, "force_ask");
+
         let (act3, _) = decide_hook_gate_action(2.92, 0.95, 0.96, 0.10, 260);
         assert_eq!(act3, "deny");
+    }
+
+    #[tokio::test]
+    async fn protected_credential_store_forces_ask_locally() {
+        let eval1 = evaluate_command_for_hook(
+            "cat ~/.config/agy-decision-lab/*",
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("자격 증명 저장소 차단 평가가 성공해야 함");
+        assert_eq!(eval1.action, "force_ask");
+        assert!(eval1.fast_path);
+
+        let eval2 = evaluate_command_for_hook(
+            "cat ~/.aws/credentials",
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("AWS 자격 증명 차단 평가가 성공해야 함");
+        assert_eq!(eval2.action, "force_ask");
+        assert!(eval2.fast_path);
     }
 }

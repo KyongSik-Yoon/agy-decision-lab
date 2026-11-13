@@ -556,7 +556,12 @@ fn append_subagent_audit_log(
 ) {
     let path = subagent_audit_log_path();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        let _ = agy_decision_lab::runtime_config::ensure_private_dir(parent);
+    }
+    if let Ok(meta) = fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        return;
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -579,7 +584,14 @@ fn append_subagent_audit_log(
         "latency_ms": outcome.route_summary.as_ref().map(|s| s.latency_ms),
     });
     if let Ok(line) = serde_json::to_string(&record) {
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        if let Ok(mut file) = opts.open(&path) {
             let _ = writeln!(file, "{line}");
         }
     }
@@ -806,7 +818,7 @@ fn save_statusline_route_cache(
     }
     let sid = sanitize_cache_id(trimmed);
     let cdir = statusline_cache_dir();
-    if fs::create_dir_all(&cdir).is_err() {
+    if agy_decision_lab::runtime_config::ensure_private_dir(&cdir).is_err() {
         return;
     }
 
@@ -821,11 +833,8 @@ fn save_statusline_route_cache(
         "{base}\t{effort}\t{short_label}\t{rank}\t{complexity_score:.2}\t{conf_pct}\t{epoch_sec}\n"
     );
 
-    let tmp_path = cdir.join(format!(".decision-route-{sid}.tsv.{}", std::process::id()));
     let final_path = cdir.join(format!("decision-route-{sid}.tsv"));
-    if fs::write(&tmp_path, line).is_ok() {
-        let _ = fs::rename(&tmp_path, &final_path);
-    }
+    let _ = agy_decision_lab::runtime_config::write_private_file(&final_path, line.as_bytes());
 }
 
 fn dedup_cache_path() -> PathBuf {
@@ -838,7 +847,10 @@ fn last_route_state_path() -> PathBuf {
 
 fn save_last_route_state(val: &serde_json::Value) {
     if let Ok(raw) = serde_json::to_string(val) {
-        let _ = fs::write(last_route_state_path(), raw);
+        let _ = agy_decision_lab::runtime_config::write_private_file(
+            &last_route_state_path(),
+            raw.as_bytes(),
+        );
     }
 }
 
@@ -858,7 +870,7 @@ fn save_turn_hash(hash_val: u64) {
     if let Ok(raw) = serde_json::to_string(&DedupCache {
         last_key_hash: hash_val,
     }) {
-        let _ = fs::write(path, raw);
+        let _ = agy_decision_lab::runtime_config::write_private_file(&path, raw.as_bytes());
     }
 }
 

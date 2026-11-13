@@ -474,7 +474,7 @@ fn record_checked_chunks(conv_id: &str, checked_chunks: &[(String, u64)]) {
     }
 
     if let Ok(serialized) = serde_json::to_string(&state) {
-        let _ = fs::write(path, serialized);
+        let _ = crate::runtime_config::write_private_file(&path, serialized.as_bytes());
     }
 }
 

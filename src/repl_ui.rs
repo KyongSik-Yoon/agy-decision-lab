@@ -248,6 +248,9 @@ impl SharedReplState {
                 self.pending_quotes.push(PendingQuote { label, content });
                 continue;
             }
+            if !is_safe_clip_id(clip_id) {
+                continue;
+            }
             let clip_file = Path::new(&runtime_dir).join(format!("agy-clip-{clip_id}.txt"));
             if let Ok(text) = fs::read_to_string(&clip_file)
                 && !text.trim().is_empty()
@@ -334,14 +337,22 @@ impl SharedReplState {
                     .as_millis()
             );
             let turn_path = Path::new(&runtime_dir).join(format!("agy-clip-{turn_id}.txt"));
-            let _ = fs::write(&turn_path, &raw_resp);
-            let _ = fs::write(
-                Path::new(&runtime_dir).join("agy-clip-latest-turn.id"),
-                &turn_id,
+            let _ = crate::runtime_config::write_private_file(&turn_path, raw_resp.as_bytes());
+            let _ = crate::runtime_config::write_private_file(
+                &Path::new(&runtime_dir).join("agy-clip-latest-turn.id"),
+                turn_id.as_bytes(),
             );
             self.last_raw_response = raw_resp;
         }
     }
+}
+
+fn is_safe_clip_id(clip_id: &str) -> bool {
+    !clip_id.is_empty()
+        && clip_id.len() <= 80
+        && clip_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// 공통 슬래시 명령어 분기 결과

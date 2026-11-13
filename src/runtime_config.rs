@@ -1,8 +1,101 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 
 use crate::rules::RuleSet;
+
+/// 심볼릭 링크 공격을 차단하면서 0700 권한으로 개인 디렉터리를 생성·보장합니다.
+pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("심볼릭 링크 디렉터리 거부: {}", path.display()),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        }
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// 심볼릭 링크를 거부하고 0600 권한의 임시 파일에 기록한 뒤 원자적으로 교체합니다.
+pub fn write_private_file(path: &Path, content: &[u8]) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "상위 디렉터리가 없는 파일 경로입니다",
+        ));
+    };
+    ensure_private_dir(parent)?;
+
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("심볼릭 링크 대상 파일 거부: {}", path.display()),
+        ));
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("private");
+    let tmp_path = parent.join(format!(".{base_name}.tmp.{}.{}", std::process::id(), nanos));
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let write_res = (|| -> io::Result<()> {
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(content)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
 
 /// 외부 규칙 파일이 전혀 없는 환경에서도 단독 동작하도록 기본 규칙 YAML을 바이너리에 내장합니다.
 pub const EMBEDDED_DEFAULT_RULES_YAML: &str = include_str!("../rules/default_rules.yaml");

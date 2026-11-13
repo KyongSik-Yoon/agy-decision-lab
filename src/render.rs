@@ -484,7 +484,7 @@ pub fn extract_code_blocks_from_markdown(markdown: &str) -> Vec<CapturedCodeBloc
                         .as_nanos()
                 );
                 let clip_path = Path::new(&runtime_dir).join(format!("agy-clip-{clip_id}.txt"));
-                let _ = std::fs::write(&clip_path, &cur_code);
+                let _ = crate::runtime_config::write_private_file(&clip_path, cur_code.as_bytes());
                 blocks.push(CapturedCodeBlock {
                     index: idx,
                     lang: std::mem::take(&mut cur_lang),
@@ -660,7 +660,7 @@ impl StreamingMarkdownPrinter {
         // 로컬 클릭 복사용 임시 파일에 코드 본문 저장 (/tmp/agy-clip-{id}.txt)
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
         let clip_path = std::path::PathBuf::from(runtime_dir).join(format!("agy-clip-{clip_id}.txt"));
-        let _ = std::fs::write(&clip_path, code);
+        let _ = crate::runtime_config::write_private_file(&clip_path, code.as_bytes());
 
         self.captured_code_blocks.push(CapturedCodeBlock {
             index: block_idx,
