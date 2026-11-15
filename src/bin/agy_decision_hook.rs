@@ -506,7 +506,7 @@ async fn evaluate_pre_tool_use(envelope: &GenericHookEnvelope) -> Result<serde_j
 
     if gate_disabled_flag_path().exists() {
         // 주의: PreToolUse에서 빈 객체("{}")를 반환하면 agy가 decision=""를 거부(deny)로 처리하므로,
-        // always-proceed 및 agy-route 흐름을 방해하지 않도록 "allow"를 명시적으로 반환합니다.
+        // always-proceed 흐름을 방해하지 않도록 "allow"를 명시적으로 반환합니다.
         return Ok(serde_json::json!({
             "decision": "allow"
         }));

@@ -45,16 +45,14 @@ for arg in "$@"; do
   esac
 done
 
-BINS=(agy-decision-hook agy-decision-mcp agy-route agy-acp)
+BINS=(agy-decision-hook agy-decision-mcp)
 PLUGINS=(decision decision-stop decision-subagent)
 
 if ! $FROM_DIST; then
   echo "[1/5] 릴리스 바이너리 빌드 중 (strip 활성화)..."
   cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --release \
     --bin agy-decision-hook \
-    --bin agy-decision-mcp \
-    --bin agy-route \
-    --bin agy-acp
+    --bin agy-decision-mcp
 
   echo "[2/5] 자립형 배포 패키지 조립 중 ($DIST_DIR)..."
   rm -rf "$DIST_DIR"
@@ -128,12 +126,15 @@ else
   echo "  ✔ 기존 XDG 설정 유지: $XDG_CFG_DIR/config.env"
 fi
 
-# 구형 .sh 래퍼 스크립트까지 모두 네이티브 ELF 바이너리로 원자적 교체
+# 구형 .sh 래퍼 및 레거시 라우터 바이너리 정리 후 네이티브 ELF 바이너리로 원자적 교체
+for legacy in agy-route agy-acp; do
+  rm -f "$HOME/.local/bin/$legacy"
+done
 for b in "${BINS[@]}"; do
   rm -f "$HOME/.local/bin/$b"
   install -m 0755 "$DIST_DIR/bin/$b" "$HOME/.local/bin/$b"
 done
-echo "  ✔ 네이티브 바이너리 4종 배포 완료 ($HOME/.local/bin/{agy-decision-hook,agy-decision-mcp,agy-route,agy-acp})"
+echo "  ✔ 네이티브 바이너리 2종 배포 완료 ($HOME/.local/bin/{agy-decision-hook,agy-decision-mcp})"
 
 echo "[5/5] 레거시 심볼릭 링크 정리 및 agy plugin install 정식 패키지 설치 중..."
 for p in "${PLUGINS[@]}"; do

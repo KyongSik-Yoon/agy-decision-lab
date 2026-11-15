@@ -643,7 +643,7 @@ pub fn decide_hook_gate_action(
         );
     }
 
-    // 일반 로컬 개발·빌드·테스트·가역적 편집 명령은 무소음 자동 허용(allow)하여 always-proceed 및 agy-route 흐름을 방해하지 않음
+    // 일반 로컬 개발·빌드·테스트·가역적 편집 명령은 무소음 자동 허용(allow)하여 always-proceed 흐름을 방해하지 않음
     (
         "allow".to_string(),
         format!("로컬 안전/표준 작업 허용 (risk={risk_score:.2}/3, {latency_ms}ms)"),

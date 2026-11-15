@@ -8,13 +8,12 @@ usage() {
 사용법: ./scripts/uninstall.sh [옵션]
 
 옵션 (여러 개 조합 가능):
-  --acp          agy-acp 상주 모델 스위칭 클라이언트(~/.local/bin/agy-acp)만 제거
   --subagent     decision-subagent(서브에이전트·스웜 동적 모델 라우터) 플러그인만 제거
   --stop         decision-stop(Stop 완료 체크리스트 검증) 플러그인만 제거
   --plugin       decision(PreToolUse 안전 게이트 + MCP) 기본 플러그인만 제거
-  --cli          ~/.local/bin/{agy-decision-hook,agy-decision-mcp,agy-route,agy-acp} 바이너리 제거
+  --cli          ~/.local/bin/{agy-decision-hook,agy-decision-mcp} 바이너리 제거 (레거시 agy-route/agy-acp 포함 정리)
   --purge-config ~/.config/agy-decision-lab 설정 및 ~/.local/state/agy-decision-lab 상태까지 완전 삭제
-  --all          플러그인 3종, agy-acp 래퍼, 런타임 임시 캐시를 모두 제거
+  --all          플러그인 3종 및 런타임 임시 캐시를 모두 제거
                  (기본적으로 ~/.config/agy-decision-lab/config.env 의 API 키는 보존하며, 삭제하려면 --purge-config 추가)
   -h, --help     도움말 표시
 EOF
@@ -25,7 +24,6 @@ if [ $# -eq 0 ]; then
   exit 1
 fi
 
-DO_ACP=false
 DO_SUBAGENT=false
 DO_STOP=false
 DO_PLUGIN=false
@@ -35,14 +33,12 @@ DO_CACHE=false
 
 for arg in "$@"; do
   case "$arg" in
-    --acp)          DO_ACP=true ;;
     --subagent)     DO_SUBAGENT=true ;;
     --stop)         DO_STOP=true ;;
     --plugin)       DO_PLUGIN=true ;;
     --cli)          DO_CLI=true ;;
     --purge-config) DO_PURGE_CFG=true ;;
     --all)
-      DO_ACP=true
       DO_SUBAGENT=true
       DO_STOP=true
       DO_PLUGIN=true
@@ -99,13 +95,14 @@ if $DO_PLUGIN; then
   rm -rf "$HOME/.gemini/antigravity-cli/mcp/decision_lab" 2>/dev/null || true
 fi
 
-if $DO_ACP; then
-  remove_entry "$HOME/.local/bin/agy-acp" "agy-acp 상주 라우터/프록시 바이너리"
-fi
-
 if $DO_CLI; then
-  for b in agy-decision-hook agy-decision-mcp agy-route agy-acp; do
+  for b in agy-decision-hook agy-decision-mcp; do
     remove_entry "$HOME/.local/bin/$b" "$b CLI 바이너리"
+  done
+  for legacy in agy-route agy-acp; do
+    if [ -L "$HOME/.local/bin/$legacy" ] || [ -e "$HOME/.local/bin/$legacy" ]; then
+      remove_entry "$HOME/.local/bin/$legacy" "$legacy 레거시 바이너리"
+    fi
   done
 fi
 
