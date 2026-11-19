@@ -668,7 +668,7 @@ async fn evaluate_pre_invocation(
     let current_tier = infer_active_model_tier(&payload.model_name);
     let recommended_tier = match summary.selected_family.as_str() {
         "hydrogen" | "flash" => 0,
-        "argon" => 1,
+        "neon" | "argon" => 1,
         _ => 2,
     };
 
@@ -706,7 +706,7 @@ fn infer_active_model_tier(model_name: &str) -> u8 {
     } else if lower.contains("carbon") || lower.contains("opus") {
         2
     } else {
-        // Hydrogen Medium/High/XHigh, Argon, Sonnet 등 코딩 주력 모델
+        // Hydrogen Medium/High/XHigh, Neon, Sonnet 등 코딩 주력 모델
         1
     }
 }
@@ -788,6 +788,8 @@ fn split_model_for_statusline(
         10
     } else if base.contains("hydrogen") {
         15
+    } else if base.contains("neon") {
+        20
     } else if base.contains("carbon") || base.contains("opus") || base.contains("pro") {
         30
     } else {

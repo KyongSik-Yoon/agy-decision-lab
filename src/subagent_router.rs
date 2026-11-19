@@ -314,10 +314,10 @@ fn resolve_swarm_add_policy(
     let mut guard_applied: Option<String> = None;
 
     // 2. 작성자 워커 하한선(Author Floor): share / branch / fork 워커는 코드를 직접 수정하므로
-    //    3.8-flash 수동 설정 시 Argon 이상, 기본 Hydrogen 4는 최소 medium 이상만 허용
+    //    3.8-flash 수동 설정 시 Neon 이상, 기본 Hydrogen 4는 최소 medium 이상만 허용
     if is_author_worker && matches!(final_family.as_str(), "hydrogen" | "flash") {
         if targets.hydrogen_base.to_ascii_lowercase().contains("flash") {
-            final_family = "argon".to_string();
+            final_family = "neon".to_string();
             final_level = if summary.complexity_score < 1.35 {
                 "low".to_string()
             } else {
@@ -397,7 +397,8 @@ fn resolve_invoke_subagent_policy(
             "flash_lite"
         } else if (matches!(summary.selected_family.as_str(), "hydrogen" | "flash")
             && summary.complexity_score < 2.15)
-            || (summary.selected_family == "argon" && summary.complexity_score < 1.90)
+            || (matches!(summary.selected_family.as_str(), "neon" | "argon")
+                && summary.complexity_score < 1.90)
         {
             "flash"
         } else if parent_tier >= 2 {
@@ -430,7 +431,7 @@ fn resolve_invoke_subagent_policy(
                     "inherit"
                 }
             }
-            "argon" => {
+            "neon" | "argon" => {
                 if parent_tier == 0 {
                     // 부모가 Flash일 때 기능 구현 서브에이전트는 pro로 승격하여 성능 저하 방지
                     "pro"
@@ -561,7 +562,7 @@ fn is_external_vendor_model(model: &str, targets: &ModelTargets) -> bool {
     let lower = model.trim().to_ascii_lowercase();
     let known_bases = [
         targets.hydrogen_base.to_ascii_lowercase(),
-        targets.argon_base.to_ascii_lowercase(),
+        targets.neon_base.to_ascii_lowercase(),
         targets.carbon_base.to_ascii_lowercase(),
     ];
     if known_bases.iter().any(|b| lower.starts_with(b)) {
@@ -615,7 +616,7 @@ mod tests {
     fn default_targets() -> ModelTargets {
         ModelTargets {
             hydrogen_base: "gemini-4-hydrogen".to_string(),
-            argon_base: "gemini-4-argon".to_string(),
+            neon_base: "gemini-4-neon".to_string(),
             carbon_base: "gemini-4-carbon".to_string(),
         }
     }
@@ -769,9 +770,24 @@ mod tests {
         });
         let spec =
             extract_subagent_call("invoke_subagent", &args, "Gemini 4 Hydrogen (Low)").unwrap();
-        let summary = mock_summary("gemini-4-argon-medium", "argon", "argon_feature", 1.7, 0.85);
+        let summary = mock_summary("gemini-4-neon-medium", "neon", "neon_balanced", 1.7, 0.85);
         let out = resolve_subagent_policy(&spec, summary, &default_targets());
         assert!(out.rewritten);
         assert_eq!(out.selected_model, "pro");
+    }
+
+    #[test]
+    fn swarm_author_worker_allows_neon_xhigh() {
+        let args = serde_json::json!({
+            "action": "add",
+            "name": "author",
+            "workspace": "branch",
+            "brief": "Refactor cross-module API routing and security checks"
+        });
+        let spec = extract_subagent_call("swarm", &args, "Gemini 4 Neon (High)").unwrap();
+        let summary = mock_summary("gemini-4-neon-xhigh", "neon", "neon_balanced", 3.1, 0.91);
+        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        assert_eq!(out.selected_model, "gemini-4-neon-xhigh");
+        assert!(out.guard_applied.is_none());
     }
 }

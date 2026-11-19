@@ -4,8 +4,8 @@
 
 1. **네이티브 `decision` 플러그인 (`plugins/decision`)**: `PreToolUse` 무소음 안전 검문소(`always-proceed` 호환 `allow` 패스스루 + 파괴·유출 고위험 명령만 `force_ask`/`deny`) + `decision_lab` MCP 서버 + `decision-checklist` 스킬 통합
 2. **네이티브 `decision-stop` 플러그인 (`plugins/decision-stop`)**: 에이전트 작업 완료(`Stop`) 시 백그라운드 대기·읽기 전용 턴은 0ms 통과시키고 변경된 파일의 Git diff만 증분 스캔해 `critical`/`high` 체크리스트 위반을 검증하는 독립 플러그인
-3. **네이티브 `decision-subagent` 플러그인 (`plugins/decision-subagent`)**: 메인 에이전트의 프롬프트 캐시를 깨뜨리지 않고 하위 서브에이전트(`invoke_subagent`) 및 스웜 워커(`swarm add`) 스폰 시점에 `PreToolUse` `overwrite`로 최적 모델(Gemini 4 Hydrogen·Argon·Carbon 10단계)과 추론 강도(`low`/`medium`/`high`/`xhigh`)를 자동 주입하는 독립 플러그인
-4. **로컬 stdio MCP 서버 (`agy-decision-mcp`)**: [`rmcp`](https://crates.io/crates/rmcp) 기반 대규모 diff 체크리스트 일괄 스캔 및 멀티모달 다중 판별 도구
+3. **네이티브 `decision-subagent` 플러그인 (`plugins/decision-subagent`)**: 메인 에이전트의 프롬프트 캐시를 깨뜨리지 않고 하위 서브에이전트(`invoke_subagent`) 및 스웜 워커(`swarm add`) 스폰 시점에 `PreToolUse` `overwrite`로 최적 모델(Gemini 4 Hydrogen·Neon·Carbon 11단계)과 추론 강도(`low`/`medium`/`high`/`xhigh`)를 자동 주입하는 독립 플러그인
+4. **로컬 stdio MCP 서버 (`agy-decision-mcp`)**: [`rmcp`](https://crates.io/crates/rmcp) 기반 대규모 diff 체크리스트 일괄 스캔(`scan_code_checklist`), 명령 안전 평가(`gate_shell_command`), 멀티모달 다중 판별(`evaluate_decisions`), 다중 저장소 Git 요약(`workspace_git_digest`), 다중 파일 구간·패턴 일괄 수집(`batch_code_context`) 도구 제공
 
 ## 빌드·패키징 및 정식 배포 설치
 

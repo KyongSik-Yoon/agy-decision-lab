@@ -19,14 +19,14 @@ pub struct ImageAttachment {
     pub byte_len: usize,
 }
 
-/// 3대 Gemini 4 모델 패밀리(Hydrogen 4 / Argon 4 / Carbon 4) 베이스 설정
+/// 3대 Gemini 4 모델 패밀리(Hydrogen / Neon / Carbon) 베이스 설정
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelTargets {
-    /// 고속 코딩·실행 패밀리 베이스 (기본: gemini-4-hydrogen -> -low/-medium/-high/-xhigh 자동 조합)
+    /// 고속 코딩·실행 패밀리 베이스 (기본: gemini-4-hydrogen -> -low/-medium/-high/-xhigh, 최대 xhigh)
     pub hydrogen_base: String,
-    /// 밸런스 개발 패밀리 베이스 (기본: gemini-4-argon -> -low/-medium/-high 자동 조합)
-    pub argon_base: String,
-    /// 프론티어 추론 패밀리 베이스 (기본: gemini-4-carbon -> -low/-medium/-high 자동 조합)
+    /// 밸런스 심층 코딩·분석 패밀리 베이스 (기본: gemini-4-neon -> -low/-medium/-high/-xhigh, 최대 xhigh)
+    pub neon_base: String,
+    /// 프론티어 장기 추론 패밀리 베이스 (기본: gemini-4-carbon -> -low/-medium/-high, 최대 high)
     pub carbon_base: String,
 }
 
@@ -41,21 +41,31 @@ impl ModelTargets {
                     .filter(|v| !v.trim().is_empty() && !v.trim().eq_ignore_ascii_case("gemini-3.8-flash"))
             })
             .unwrap_or_else(|| "gemini-4-hydrogen".to_string());
+        let raw_neon = std::env::var("AGY_NEON_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AGY_ARGON_BASE")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty() && !v.trim().eq_ignore_ascii_case("gemini-4-argon"))
+            })
+            .unwrap_or_else(|| "gemini-4-neon".to_string());
         Self {
             hydrogen_base: strip_effort_suffix(&raw_hydrogen),
-            argon_base: strip_effort_suffix(&env_or("AGY_ARGON_BASE", "gemini-4-argon")),
+            neon_base: strip_effort_suffix(&raw_neon),
             carbon_base: strip_effort_suffix(&env_or("AGY_CARBON_BASE", "gemini-4-carbon")),
         }
     }
 
     pub fn supports_xhigh_slug(base: &str) -> bool {
-        base.to_ascii_lowercase().contains("hydrogen")
+        let lower = base.to_ascii_lowercase();
+        lower.contains("hydrogen") || lower.contains("neon")
     }
 
     pub fn variant(&self, family: &str, level: &str) -> String {
         let base = match family {
             "hydrogen" | "flash" => &self.hydrogen_base,
-            "argon" => &self.argon_base,
+            "neon" | "argon" => &self.neon_base,
             _ => &self.carbon_base,
         };
         let effective_level = if level == "xhigh" && !Self::supports_xhigh_slug(base) {
@@ -63,7 +73,7 @@ impl ModelTargets {
         } else {
             level
         };
-        // gemini-4-hydrogen은 -low/-medium/-high/-xhigh, argon/carbon/claude 등은 -low/-medium/-high 조합
+        // gemini-4-hydrogen / gemini-4-neon은 -low/-medium/-high/-xhigh, carbon/claude 등은 -low/-medium/-high 조합
         format!("{base}-{effective_level}")
     }
 }
@@ -120,7 +130,7 @@ pub fn effort_from_level(level: usize) -> &'static str {
     }
 }
 
-/// 단일 패스(추가 지연 0ms)로 Hydrogen 4 / Argon 4 / Carbon 4 패밀리와 세부 추론 깊이를 동시 판별합니다.
+/// 단일 패스(추가 지연 0ms)로 Hydrogen / Neon / Carbon 패밀리와 세부 추론 깊이를 동시 판별합니다.
 pub fn build_routing_questions() -> BTreeMap<String, Question> {
     let mut questions = BTreeMap::new();
 
@@ -136,19 +146,19 @@ pub fn build_routing_questions() -> BTreeMap<String, Question> {
                 ),
                 (
                     "hydrogen_exec".to_string(),
-                    "Everyday coding, single- or few-file feature implementation, unit test authoring/fixing, clear bug fix, build/CI script update, or verification task.".to_string(),
+                    "Everyday coding, single- or few-file feature implementation, unit test authoring/fixing, clear bug fix, build/CI script update, or fast worker execution.".to_string(),
                 ),
                 (
-                    "argon_feature".to_string(),
-                    "Moderate multi-file coordination, cross-component API/SPI wiring, non-trivial query/state logic, or thorough multi-file code review.".to_string(),
+                    "neon_balanced".to_string(),
+                    "Complex multi-file coding, analytical reasoning, cross-component API/SPI wiring, architectural refactoring, multi-step agentic debugging, or thorough code/security review.".to_string(),
                 ),
                 (
                     "carbon_complex".to_string(),
-                    "Large multi-module refactoring, intricate async/state-machine logic, protocol or database schema migration design, or deep security/performance audit.".to_string(),
+                    "Large long-horizon multi-module refactoring, intricate async/state-machine logic, protocol or database schema migration design, or deep security/performance audit.".to_string(),
                 ),
                 (
                     "carbon_frontier".to_string(),
-                    "Complex distributed system architecture, subtle multi-threaded race/deadlock root-cause analysis, or compiler/JVM/kernel internals.".to_string(),
+                    "Hardest long-horizon projects, complex distributed system architecture, subtle multi-threaded race/deadlock root-cause analysis, or compiler/JVM/kernel internals.".to_string(),
                 ),
             ]),
         },
@@ -262,7 +272,10 @@ pub fn resolve_routing_answers(
     let rounded_score_level = complexity_score.round().clamp(0.0, 4.0) as usize;
     let effort_level = rounded_score_level.max(top_level);
 
-    // 1차 매핑: 패밀리(Hydrogen / Argon / Carbon) + 점수 기반 세부 등급(low / medium / high / xhigh) 결정
+    // 1차 매핑: 패밀리(Hydrogen / Neon / Carbon) + 점수 기반 세부 등급(low / medium / high / xhigh) 결정
+    // - Hydrogen: low / medium / high / xhigh (최대 xhigh)
+    // - Neon:     low / medium / high / xhigh (최대 xhigh)
+    // - Carbon:   low / medium / high         (최대 high)
     let (mut family, mut sub_level) = match task_tier.as_str() {
         "hydrogen_quick" | "flash_quick" => {
             let lvl = if complexity_score < 0.85 {
@@ -284,15 +297,17 @@ pub fn resolve_routing_answers(
             };
             ("hydrogen", lvl)
         }
-        "argon_feature" => {
-            let lvl = if complexity_score < 1.40 {
+        "neon_balanced" | "argon_feature" => {
+            let lvl = if complexity_score < 1.25 {
                 "low"
-            } else if complexity_score < 2.40 {
+            } else if complexity_score < 2.05 {
                 "medium"
-            } else {
+            } else if complexity_score < 2.90 {
                 "high"
+            } else {
+                "xhigh"
             };
-            ("argon", lvl)
+            ("neon", lvl)
         }
         "carbon_complex" => {
             let lvl = if complexity_score < 1.85 {
@@ -305,7 +320,7 @@ pub fn resolve_routing_answers(
             ("carbon", lvl)
         }
         _ => {
-            // carbon_frontier
+            // carbon_frontier (Carbon 최대 추론 레벨은 high)
             let lvl = if complexity_score < 2.55 {
                 "medium"
             } else {
@@ -319,29 +334,32 @@ pub fn resolve_routing_answers(
     let hydrogen_prob = tier_probabilities.get("hydrogen_quick").copied().unwrap_or(0.0)
         + tier_probabilities.get("hydrogen_exec").copied().unwrap_or(0.0)
         + tier_probabilities.get("flash_quick").copied().unwrap_or(0.0);
-    let argon_prob = tier_probabilities.get("argon_feature").copied().unwrap_or(0.0);
+    let neon_prob = tier_probabilities.get("neon_balanced").copied().unwrap_or(0.0)
+        + tier_probabilities.get("argon_feature").copied().unwrap_or(0.0);
     let carbon_prob = tier_probabilities.get("carbon_complex").copied().unwrap_or(0.0)
         + tier_probabilities.get("carbon_frontier").copied().unwrap_or(0.0);
 
     let effective_conf = match family {
         "hydrogen" => hydrogen_prob,
-        "argon" => argon_prob,
+        "neon" => neon_prob,
         _ => carbon_prob,
     }
     .max(tier_confidence)
     .clamp(0.0, 1.0);
 
-    // 2차 확신도 게이트: 경계선 질문에서 한 단계 상위 등급·패밀리로 완만하게 승격 (Hydrogen -> Argon -> Carbon)
+    // 2차 확신도 게이트: 경계선 질문에서 한 단계 상위 등급·패밀리로 완만하게 승격 (Hydrogen -> Neon -> Carbon)
     let mut escalated = false;
     if effective_conf < threshold {
         match family {
             "hydrogen" => {
-                if argon_prob + carbon_prob >= 0.35 {
-                    family = "argon";
+                if neon_prob + carbon_prob >= 0.35 {
+                    family = "neon";
                     sub_level = if complexity_score < 1.35 {
                         "low"
-                    } else {
+                    } else if complexity_score < 2.20 {
                         "medium"
+                    } else {
+                        "high"
                     };
                     escalated = true;
                 } else {
@@ -353,10 +371,19 @@ pub fn resolve_routing_answers(
                     escalated = true;
                 }
             }
-            "argon" if carbon_prob >= 0.30 => {
-                family = "carbon";
-                sub_level = "medium";
-                escalated = true;
+            "neon" => {
+                if carbon_prob >= 0.30 {
+                    family = "carbon";
+                    sub_level = "medium";
+                    escalated = true;
+                } else if sub_level != "xhigh" {
+                    sub_level = match sub_level {
+                        "low" => "medium",
+                        "medium" => "high",
+                        _ => "xhigh",
+                    };
+                    escalated = true;
+                }
             }
             _ => {}
         }
@@ -391,13 +418,13 @@ mod tests {
     fn default_targets() -> ModelTargets {
         ModelTargets {
             hydrogen_base: "gemini-4-hydrogen".to_string(),
-            argon_base: "gemini-4-argon".to_string(),
+            neon_base: "gemini-4-neon".to_string(),
             carbon_base: "gemini-4-carbon".to_string(),
         }
     }
 
     #[test]
-    fn distributes_across_hydrogen_argon_and_carbon_spectrum() {
+    fn distributes_across_hydrogen_neon_and_carbon_spectrum() {
         let targets = default_targets();
 
         // 1. Hydrogen exec 고복잡도 -> gemini-4-hydrogen-xhigh (네이티브 xhigh 슬러그)
@@ -423,7 +450,7 @@ mod tests {
         assert_eq!(r1.selected_model, "gemini-4-hydrogen-xhigh");
         assert!(r1.cli_effort_flag.is_none());
 
-        // 2. 불확실한 Hydrogen -> Argon 비중이 높으면 Argon으로 완만 승격
+        // 2. 불확실한 Hydrogen -> Neon 비중이 높으면 Neon으로 완만 승격
         let mut a2 = BTreeMap::new();
         a2.insert(
             "task_tier".to_string(),
@@ -431,7 +458,7 @@ mod tests {
                 choice: "hydrogen_quick".to_string(),
                 probabilities: BTreeMap::from([
                     ("hydrogen_quick".to_string(), 0.51),
-                    ("argon_feature".to_string(), 0.49),
+                    ("neon_balanced".to_string(), 0.49),
                 ]),
                 confidence: 0.51,
             },
@@ -447,7 +474,7 @@ mod tests {
         );
         let r2 = resolve_routing_answers(&a2, Some((100, 0)), 200, 0.60, &targets).unwrap();
         assert!(r2.escalated_by_confidence_gate);
-        assert_eq!(r2.selected_model, "gemini-4-argon-low");
+        assert_eq!(r2.selected_model, "gemini-4-neon-low");
 
         // 3. Hydrogen 내부 확률 분산(quick + exec)은 패밀리 통합 확신도로 인정되어 불필요 승격 방지
         let mut a3 = BTreeMap::new();
@@ -458,7 +485,7 @@ mod tests {
                 probabilities: BTreeMap::from([
                     ("hydrogen_exec".to_string(), 0.45),
                     ("hydrogen_quick".to_string(), 0.40),
-                    ("argon_feature".to_string(), 0.15),
+                    ("neon_balanced".to_string(), 0.15),
                 ]),
                 confidence: 0.45,
             },
@@ -476,5 +503,32 @@ mod tests {
         assert!(!r3.escalated_by_confidence_gate);
         assert!((r3.tier_confidence - 0.85).abs() < 1e-6);
         assert_eq!(r3.selected_model, "gemini-4-hydrogen-high");
+
+        // 4. Neon 고복잡도 -> gemini-4-neon-xhigh (네이티브 xhigh 지원)
+        let mut a4 = BTreeMap::new();
+        a4.insert(
+            "task_tier".to_string(),
+            Answer::Choice {
+                choice: "neon_balanced".to_string(),
+                probabilities: BTreeMap::from([("neon_balanced".to_string(), 0.88)]),
+                confidence: 0.88,
+            },
+        );
+        a4.insert(
+            "reasoning_effort".to_string(),
+            Answer::Score {
+                score: 3.15,
+                legend: BTreeMap::new(),
+                probabilities: BTreeMap::from([("3".to_string(), 0.75)]),
+                confidence: 0.75,
+            },
+        );
+        let r4 = resolve_routing_answers(&a4, Some((100, 0)), 200, 0.60, &targets).unwrap();
+        assert_eq!(r4.selected_model, "gemini-4-neon-xhigh");
+
+        // 5. Carbon은 최대 추론 레벨이 high이므로 xhigh 요청 시 high로 클램프
+        assert_eq!(targets.variant("carbon", "xhigh"), "gemini-4-carbon-high");
+        assert_eq!(targets.variant("neon", "xhigh"), "gemini-4-neon-xhigh");
+        assert_eq!(targets.variant("hydrogen", "xhigh"), "gemini-4-hydrogen-xhigh");
     }
 }
