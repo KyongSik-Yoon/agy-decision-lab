@@ -6,3 +6,4 @@ pub mod runtime_config;
 pub mod stop_gate;
 pub mod subagent_router;
 pub mod types;
+pub mod workspace_tools;

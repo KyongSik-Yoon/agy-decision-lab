@@ -6,6 +6,10 @@ use agy_decision_lab::{
     types::{
         Answer, DecisionInput, DecisionRequest, InputBlock, MediaResolution, NoulCriteria, Question,
     },
+    workspace_tools::{
+        BatchCodeContextArgs, WorkspaceGitDigestArgs, run_batch_code_context,
+        run_workspace_git_digest,
+    },
 };
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STD};
@@ -120,6 +124,32 @@ impl DecisionMcpServer {
         Parameters(args): Parameters<EvaluateDecisionsArgs>,
     ) -> String {
         match self.run_evaluate_decisions(args).await {
+            Ok(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|e| e.to_string()),
+            Err(err) => json_error(&format!("{err:#}")),
+        }
+    }
+
+    #[tool(
+        description = "Collect Git status, branch/ahead-behind, recent commits, diff stats, and optional truncated patch across one or multiple repositories in parallel without shell chaining."
+    )]
+    async fn workspace_git_digest(
+        &self,
+        Parameters(args): Parameters<WorkspaceGitDigestArgs>,
+    ) -> String {
+        match run_workspace_git_digest(args).await {
+            Ok(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|e| e.to_string()),
+            Err(err) => json_error(&format!("{err:#}")),
+        }
+    }
+
+    #[tool(
+        description = "Batch-extract file line ranges or log tails and ripgrep pattern context across multiple paths in one call, with sensitive secret-file exclusion and total character budget."
+    )]
+    async fn batch_code_context(
+        &self,
+        Parameters(args): Parameters<BatchCodeContextArgs>,
+    ) -> String {
+        match run_batch_code_context(args).await {
             Ok(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|e| e.to_string()),
             Err(err) => json_error(&format!("{err:#}")),
         }
