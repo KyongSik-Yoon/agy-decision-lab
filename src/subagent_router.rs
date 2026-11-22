@@ -257,7 +257,9 @@ pub fn resolve_subagent_policy(
 ) -> SubagentRouteOutcome {
     match spec.kind {
         SubagentToolKind::SwarmAdd => resolve_swarm_add_policy(spec, summary, targets),
-        SubagentToolKind::InvokeSubagent => resolve_invoke_subagent_policy(spec, summary),
+        SubagentToolKind::InvokeSubagent => {
+            resolve_invoke_subagent_policy(spec, summary, &TierModels::from_env())
+        }
     }
 }
 
@@ -376,20 +378,84 @@ fn resolve_swarm_add_policy(
 fn resolve_invoke_subagent_policy(
     spec: &SubagentCallSpec,
     summary: RouteDecisionSummary,
+    tiers: &TierModels,
 ) -> SubagentRouteOutcome {
     let is_research = spec.target_name.eq_ignore_ascii_case("research");
-    let is_mutating_ws = is_mutating_workspace(&spec.workspace);
-    let parent_tier = infer_parent_tier(&spec.parent_model);
     let effective_req = if spec.requested_model.is_empty() {
         "inherit"
     } else {
         spec.requested_model.as_str()
     };
 
-    let mut guard_applied: Option<String> = None;
-
     // invoke_subagent 허용 티어: "inherit" | "flash_lite" | "flash" | "pro"
-    let mut target_tier = if is_research {
+    let aligned = tiers.family_aligned();
+    let (mut target_tier, mut guard_applied) = if aligned {
+        aligned_invoke_tier(spec, &summary, tiers)
+    } else {
+        server_invoke_tier(spec, &summary, tiers)
+    };
+
+    // 호출자가 명시적으로 "pro"를 지정한 경우, 확실한 단순 research 조회가 아니면 강등 금지
+    if effective_req.eq_ignore_ascii_case("pro")
+        && matches!(target_tier, "flash" | "flash_lite")
+        && !(is_research && summary.tier_confidence >= 0.85 && summary.complexity_score < 1.10)
+    {
+        target_tier = "pro";
+        guard_applied = Some("explicit_pro_downgrade_guard".to_string());
+    }
+
+    let rewritten = !effective_req.eq_ignore_ascii_case(target_tier);
+    let reason = format!(
+        "Decision subagent 라우팅(type={}, tier={}, score={:.2}, conf={:.0}%{}{}) -> {}",
+        spec.target_name,
+        summary.task_tier,
+        summary.complexity_score,
+        summary.tier_confidence * 100.0,
+        if aligned { ", tiers=aligned" } else { "" },
+        guard_applied
+            .as_deref()
+            .map(|g| format!(", guard={g}"))
+            .unwrap_or_default(),
+        target_tier
+    );
+
+    SubagentRouteOutcome {
+        kind: spec.kind,
+        target_name: spec.target_name.clone(),
+        workspace: spec.workspace.clone(),
+        requested_model: effective_req.to_string(),
+        selected_model: target_tier.to_string(),
+        model_arg_key: spec.model_arg_key.clone(),
+        rewritten,
+        guard_applied,
+        reason,
+        route_summary: Some(summary),
+    }
+}
+
+/// 서버 기본 티어(pro = Hydrogen xhigh 등)일 때의 정책.
+/// 고난도 작업을 "pro"로 올릴 때, 부모가 이미 `pro` 티어 모델보다 상위면(예: Neon High 부모 vs Hydrogen xhigh)
+/// 올리는 게 아니라 내리는 셈이므로 inherit 를 유지한다(`preserve_parent_above_pro`).
+fn server_invoke_tier(
+    spec: &SubagentCallSpec,
+    summary: &RouteDecisionSummary,
+    tiers: &TierModels,
+) -> (&'static str, Option<String>) {
+    let is_research = spec.target_name.eq_ignore_ascii_case("research");
+    let is_mutating_ws = is_mutating_workspace(&spec.workspace);
+    let parent_tier = infer_parent_tier(&spec.parent_model);
+    let parent_above_pro = model_rank(&spec.parent_model) > model_rank(&tiers.pro);
+    let mut guard_applied: Option<String> = None;
+    let upgrade_to_pro = |guard: &mut Option<String>| {
+        if parent_above_pro {
+            *guard = Some("preserve_parent_above_pro".to_string());
+            "inherit"
+        } else {
+            "pro"
+        }
+    };
+
+    let target_tier = if is_research {
         if matches!(summary.selected_family.as_str(), "hydrogen" | "flash")
             && summary.complexity_score < 0.45
             && summary.tier_confidence >= 0.82
@@ -405,7 +471,7 @@ fn resolve_invoke_subagent_policy(
             // 부모가 이미 Carbon/Opus급이면 고난도 리서치 시 추론 강도까지 물려받는 inherit 우선
             "inherit"
         } else {
-            "pro"
+            upgrade_to_pro(&mut guard_applied)
         }
     } else {
         // self 또는 커스텀 에이전트 (코드 작성·명령 실행 가능): flash_lite 절대 금지
@@ -455,47 +521,62 @@ fn resolve_invoke_subagent_policy(
                 if parent_tier >= 2 {
                     "inherit"
                 } else {
-                    "pro"
+                    upgrade_to_pro(&mut guard_applied)
                 }
             }
         }
     };
+    (target_tier, guard_applied)
+}
 
-    // 호출자가 명시적으로 "pro"를 지정한 경우, 확실한 단순 research 조회가 아니면 강등 금지
-    if effective_req.eq_ignore_ascii_case("pro")
-        && matches!(target_tier, "flash" | "flash_lite")
-        && !(is_research && summary.tier_confidence >= 0.85 && summary.complexity_score < 1.10)
+/// 티어가 패밀리 순서로 고정된 경우(agy-cli-patch: flash_lite=Hydrogen, flash=Neon·Argon, pro=Carbon)의 정책.
+/// 결정 모델이 고른 패밀리를 같은 패밀리 티어로 보내고, 기존 하한·보존 규칙은 유지한다.
+fn aligned_invoke_tier(
+    spec: &SubagentCallSpec,
+    summary: &RouteDecisionSummary,
+    tiers: &TierModels,
+) -> (&'static str, Option<String>) {
+    let is_research = spec.target_name.eq_ignore_ascii_case("research");
+    let is_mutating_ws = is_mutating_workspace(&spec.workspace);
+    let mut guard_applied: Option<String> = None;
+
+    let mut want = match summary.selected_family.as_str() {
+        "carbon" => "pro",
+        "neon" | "argon" => "flash",
+        _ => "flash_lite",
+    };
+    // 원하는 추론 강도가 티어 모델보다 두 단계 이상 높으면 한 티어 위로 (예: Hydrogen xhigh 작업 -> Neon medium)
+    let (_, desired_effort) = model_rank(&summary.selected_model);
+    let (_, tier_effort) = model_rank(tiers.get(want));
+    if desired_effort >= tier_effort + 2 {
+        want = match want {
+            "flash_lite" => "flash",
+            _ => "pro",
+        };
+    }
+    // 코드를 쓰는 서브에이전트(self·커스텀)는 flash_lite 금지 — 기존 하한 유지
+    if !is_research && want == "flash_lite" {
+        want = "flash";
+        guard_applied = Some("exec_subagent_floor".to_string());
+    }
+
+    let (parent_family, parent_effort) = model_rank(&spec.parent_model);
+    let (want_family, want_effort) = model_rank(tiers.get(want));
+    if parent_family == want_family
+        && (parent_effort == want_effort || (desired_effort > want_effort && parent_effort >= desired_effort))
     {
-        target_tier = "pro";
-        guard_applied = Some("explicit_pro_downgrade_guard".to_string());
+        // 부모가 곧 그 티어 모델이거나, 결정 모델이 원한 강도를 부모만 채울 수 있으면 부모를 잇는다.
+        // 원한 강도가 티어 모델 이하면(더 싸게 충분) 같은 패밀리라도 티어로 내린다.
+        return ("inherit", guard_applied);
     }
-
-    let rewritten = !effective_req.eq_ignore_ascii_case(target_tier);
-    let reason = format!(
-        "Decision subagent 라우팅(type={}, tier={}, score={:.2}, conf={:.0}%{}) -> {}",
-        spec.target_name,
-        summary.task_tier,
-        summary.complexity_score,
-        summary.tier_confidence * 100.0,
-        guard_applied
-            .as_deref()
-            .map(|g| format!(", guard={g}"))
-            .unwrap_or_default(),
-        target_tier
-    );
-
-    SubagentRouteOutcome {
-        kind: spec.kind,
-        target_name: spec.target_name.clone(),
-        workspace: spec.workspace.clone(),
-        requested_model: effective_req.to_string(),
-        selected_model: target_tier.to_string(),
-        model_arg_key: spec.model_arg_key.clone(),
-        rewritten,
-        guard_applied,
-        reason,
-        route_summary: Some(summary),
+    if want == "flash"
+        && parent_family == 3
+        && (is_mutating_ws || summary.tier_confidence < 0.82 || summary.complexity_score >= 1.55)
+    {
+        // Carbon 부모의 애매하거나 코드를 바꾸는 밸런스 작업은 부모 강도 유지
+        return ("inherit", Some("preserve_parent_carbon_effort".to_string()));
     }
+    (want, guard_applied)
 }
 
 fn passthrough_outcome(
@@ -539,6 +620,97 @@ fn env_flag(key: &str, default: bool) -> bool {
 
 fn is_mutating_workspace(ws: &str) -> bool {
     matches!(ws.trim().to_ascii_lowercase().as_str(), "share" | "branch")
+}
+
+/// invoke_subagent 의 티어(flash_lite / flash / pro)가 실제로 실행하는 모델.
+/// 서버가 계정별로 정하며(기본값 `server_default`), agy-cli-patch 의 티어 고정 패치
+/// (pro-tier·flash-tier·flash-lite-tier)를 적용했다면 `AGY_TIER_MODELS` 로 알려 준다.
+/// 예: `AGY_TIER_MODELS=pro=gemini-4-carbon-high,flash=gemini-4-neon-medium,flash_lite=gemini-4-hydrogen-low`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierModels {
+    pub flash_lite: String,
+    pub flash: String,
+    pub pro: String,
+}
+
+impl TierModels {
+    pub fn server_default() -> Self {
+        Self {
+            flash_lite: "gemini-3.5-flash-lite".to_string(),
+            flash: "gemini-3.8-flash".to_string(),
+            pro: "gemini-4-hydrogen-tiered-xhigh".to_string(),
+        }
+    }
+
+    /// `tier=model` 을 쉼표로 이은 값. 빠진 티어는 서버 기본값을 쓴다.
+    pub fn parse(raw: &str) -> Self {
+        let mut out = Self::server_default();
+        for entry in raw.split(',') {
+            let Some((tier, model)) = entry.split_once('=') else {
+                continue;
+            };
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            match tier.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+                "flash_lite" => out.flash_lite = model.to_string(),
+                "flash" => out.flash = model.to_string(),
+                "pro" => out.pro = model.to_string(),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    pub fn from_env() -> Self {
+        std::env::var("AGY_TIER_MODELS")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| Self::parse(&v))
+            .unwrap_or_else(Self::server_default)
+    }
+
+    fn get(&self, tier: &str) -> &str {
+        match tier {
+            "flash_lite" => &self.flash_lite,
+            "flash" => &self.flash,
+            _ => &self.pro,
+        }
+    }
+
+    /// 세 티어가 Hydrogen < Neon·Argon < Carbon 패밀리 순서로 고정돼 있는지
+    pub fn family_aligned(&self) -> bool {
+        model_rank(&self.flash_lite).0 == 1 && model_rank(&self.flash).0 == 2 && model_rank(&self.pro).0 == 3
+    }
+}
+
+/// 모델 이름(슬러그·표시 이름)의 (패밀리 서열, 추론 강도 서열).
+/// 패밀리: Flash 0 < Hydrogen 1 < Neon·Argon·Sonnet 2 < Carbon·Opus 3 (알 수 없으면 Hydrogen 취급),
+/// 강도: low 1 < medium 2 < high 3 < xhigh 4 (표기 없으면 medium 취급).
+fn model_rank(name: &str) -> (u8, u8) {
+    let l = name.trim().to_ascii_lowercase();
+    let family = if l.contains("carbon") || l.contains("opus") {
+        3
+    } else if l.contains("neon") || l.contains("argon") || l.contains("sonnet") {
+        2
+    } else if l.contains("flash") {
+        0
+    } else {
+        1
+    };
+    let effort = if l.contains("xhigh") {
+        4
+    } else if l.contains("high") {
+        3
+    } else if l.contains("medium") {
+        2
+    } else if l.contains("low") {
+        1
+    } else {
+        2
+    };
+    (family, effort)
 }
 
 fn infer_parent_tier(model_name: &str) -> u8 {
@@ -790,4 +962,93 @@ mod tests {
         assert_eq!(out.selected_model, "gemini-4-neon-xhigh");
         assert!(out.guard_applied.is_none());
     }
+
+    fn aligned_tiers() -> TierModels {
+        TierModels::parse("pro=gemini-4-carbon-high, flash=gemini-4-neon-medium, flash-lite=gemini-4-hydrogen-low")
+    }
+
+    fn route_invoke(
+        type_name: &str,
+        workspace: Option<&str>,
+        requested: Option<&str>,
+        parent: &str,
+        summary: RouteDecisionSummary,
+        tiers: &TierModels,
+    ) -> SubagentRouteOutcome {
+        let mut args = serde_json::json!({ "TypeName": type_name, "Role": "Worker", "Prompt": "Do the task." });
+        if let Some(ws) = workspace {
+            args["Workspace"] = ws.into();
+        }
+        if let Some(m) = requested {
+            args["Model"] = m.into();
+        }
+        let spec = extract_subagent_call("invoke_subagent", &args, parent).unwrap();
+        resolve_invoke_subagent_policy(&spec, summary, tiers)
+    }
+
+    #[test]
+    fn tier_models_parse_and_alignment() {
+        assert!(!TierModels::server_default().family_aligned());
+        let t = aligned_tiers();
+        assert_eq!(t.flash_lite, "gemini-4-hydrogen-low");
+        assert!(t.family_aligned());
+        // 빠진 티어는 서버 기본값, 모르는 키는 무시
+        let partial = TierModels::parse("pro=gemini-4-carbon-high,ultra=x,flash=");
+        assert_eq!(partial.pro, "gemini-4-carbon-high");
+        assert_eq!(partial.flash, TierModels::server_default().flash);
+        assert!(!partial.family_aligned());
+        assert!(model_rank("Gemini 4 Neon (High)") > model_rank("gemini-4-hydrogen-tiered-xhigh"));
+        assert!(model_rank("gemini-4-hydrogen-xhigh") == model_rank("gemini-4-hydrogen-tiered-xhigh"));
+    }
+
+    #[test]
+    fn server_tiers_keep_inherit_when_parent_ranks_above_pro() {
+        let server = TierModels::server_default();
+        for type_name in ["research", "self"] {
+            let summary = mock_summary("gemini-4-carbon-medium", "carbon", "carbon_complex", 3.25, 0.77);
+            let out = route_invoke(type_name, None, None, "gemini-4-neon-high", summary, &server);
+            assert_eq!(out.selected_model, "inherit", "{type_name}");
+            assert_eq!(out.guard_applied.as_deref(), Some("preserve_parent_above_pro"));
+        }
+        // 부모가 pro(Hydrogen xhigh) 이하면 그대로 pro 로 올린다
+        let summary = mock_summary("gemini-4-carbon-medium", "carbon", "carbon_complex", 3.29, 0.75);
+        let out = route_invoke("research", None, None, "gemini-4-hydrogen-xhigh", summary, &server);
+        assert_eq!(out.selected_model, "pro");
+        assert!(out.guard_applied.is_none());
+    }
+
+    #[test]
+    fn aligned_tiers_route_each_family_to_its_tier() {
+        let t = aligned_tiers();
+        let s = |m: &str, fam: &str, tier: &str, score: f64| mock_summary(m, fam, tier, score, 0.85);
+
+        // Carbon 작업: Neon 부모에서도 pro(=Carbon)로 올린다
+        let out = route_invoke("research", None, None, "gemini-4-neon-high", s("gemini-4-carbon-medium", "carbon", "carbon_complex", 3.25), &t);
+        assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("pro", true, None));
+        // 부모가 곧 Carbon High 면 inherit
+        let out = route_invoke("self", Some("branch"), None, "Gemini 4 Carbon (High)", s("gemini-4-carbon-high", "carbon", "carbon_frontier", 3.5), &t);
+        assert_eq!(out.selected_model, "inherit");
+        // Neon 작업: Flash 부모 -> flash(=Neon medium)
+        let out = route_invoke("self", None, None, "gemini-3.8-flash-low", s("gemini-4-neon-medium", "neon", "neon_balanced", 1.7), &t);
+        assert_eq!(out.selected_model, "flash");
+        // Neon High 를 원하고 부모가 Neon High 면 부모 유지
+        let out = route_invoke("self", None, None, "gemini-4-neon-high", s("gemini-4-neon-high", "neon", "neon_balanced", 2.2), &t);
+        assert_eq!(out.selected_model, "inherit");
+        // Carbon 부모의 코드 변경 밸런스 작업은 부모 강도 유지
+        let out = route_invoke("self", Some("branch"), None, "gemini-4-carbon-high", s("gemini-4-neon-medium", "neon", "neon_balanced", 1.2), &t);
+        assert_eq!((out.selected_model.as_str(), out.guard_applied.as_deref()), ("inherit", Some("preserve_parent_carbon_effort")));
+        // 간단한 리서치는 Hydrogen 부모라도 더 싼 flash_lite(=Hydrogen low)로
+        let out = route_invoke("research", None, None, "gemini-4-hydrogen-high", s("gemini-4-hydrogen-low", "hydrogen", "hydrogen_quick", 0.4), &t);
+        assert_eq!(out.selected_model, "flash_lite");
+        // Hydrogen xhigh 를 원하는 리서치는 한 티어 위(flash)
+        let out = route_invoke("research", None, None, "gemini-3.8-flash-low", s("gemini-4-hydrogen-xhigh", "hydrogen", "hydrogen_exec", 2.4), &t);
+        assert_eq!(out.selected_model, "flash");
+        // 코드를 쓰는 서브에이전트는 flash_lite 금지
+        let out = route_invoke("self", None, None, "gemini-3.8-flash-low", s("gemini-4-hydrogen-medium", "hydrogen", "hydrogen_exec", 0.9), &t);
+        assert_eq!((out.selected_model.as_str(), out.guard_applied.as_deref()), ("flash", Some("exec_subagent_floor")));
+        // 명시적 pro 는 강등하지 않는다
+        let out = route_invoke("self", None, Some("pro"), "gemini-4-neon-high", s("gemini-4-neon-medium", "neon", "neon_balanced", 1.4), &t);
+        assert_eq!((out.selected_model.as_str(), out.guard_applied.as_deref()), ("pro", Some("explicit_pro_downgrade_guard")));
+    }
+
 }

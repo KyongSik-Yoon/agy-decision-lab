@@ -48,6 +48,18 @@ agy-decision-hook test-stop          # 현재 작업 트리의 git diff로 Stop 
 ./scripts/uninstall.sh --all                       # 플러그인 3종 및 런타임 캐시 일괄 제거
 ```
 
+## `invoke_subagent` 티어 모델 (`AGY_TIER_MODELS`)
+
+`invoke_subagent`는 모델을 티어(`inherit`/`flash_lite`/`flash`/`pro`)로만 받고, 실제 모델은 Antigravity 서버가 계정별로 정합니다(관측값: `pro` = `gemini-4-hydrogen-tiered-xhigh`, `flash_lite` = `gemini-3.5-flash-lite`). 라우터는 각 티어가 어떤 모델인지 알아야 올바르게 승격·보존하므로, [agy-cli-patch](https://github.com/KyongSik-Yoon/agy-cli-patch)의 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)로 바꿨다면 `config.env`에 그 표를 적습니다.
+
+```bash
+AGY_TIER_MODELS=pro=gemini-4-carbon-high,flash=gemini-4-neon-medium,flash_lite=gemini-4-hydrogen-low
+```
+
+- **미설정(서버 기본값)**: 기존 정책을 쓰되, 고난도 작업을 `pro`로 올릴 때 부모가 이미 `pro` 모델보다 상위(예: Neon High 부모)면 `inherit`를 유지합니다(`preserve_parent_above_pro`).
+- **Hydrogen < Neon·Argon < Carbon 순서로 고정된 표**: 결정 모델이 고른 패밀리를 같은 패밀리 티어로 보냅니다(carbon→`pro`, neon·argon→`flash`, hydrogen→`flash_lite`). 코드를 쓰는 서브에이전트의 `flash_lite` 금지, Carbon 부모 강도 보존, 명시적 `pro` 강등 금지는 그대로입니다.
+- agy가 업데이트되어 티어 고정 패치가 풀리면 표와 실제가 어긋나므로, 패치를 다시 적용하거나 이 값을 지우세요.
+
 ## 보안 및 과금 분리 원칙
 
 - `agy` 본체(`~/.gemini/antigravity-cli/settings.json`)의 Google 계정 로그인 세션(AI Ultra 쿼터)은 변경하지 않고 그대로 유지합니다.
