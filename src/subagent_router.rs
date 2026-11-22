@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -50,6 +53,8 @@ pub struct SubagentRouteOutcome {
     pub guard_applied: Option<String>,
     pub reason: String,
     pub route_summary: Option<RouteDecisionSummary>,
+    /// invoke_subagent 판정에 쓴 티어 표와 출처 (`ResolvedTiers::describe`)
+    pub tiers: Option<String>,
 }
 
 /// PreToolUse의 toolCall 이름과 인자에서 서브에이전트/스웜 스폰 호출인지 판별하고 명세를 추출합니다.
@@ -225,6 +230,7 @@ pub async fn evaluate_subagent_for_hook(
             guard_applied: Some("swarm_monitor_fastpath".to_string()),
             reason: format!("swarm_monitor 경량 폴링 워커 -> {monitor_model}"),
             route_summary: None,
+            tiers: None,
         });
     }
 
@@ -246,7 +252,13 @@ pub async fn evaluate_subagent_for_hook(
     )
     .await?;
 
-    Ok(resolve_subagent_policy(spec, summary, &targets))
+    // 티어 표는 invoke_subagent 판정에만 쓰므로 그때만 감지한다 (캐시 적중 시 파일 stat 한 번)
+    let tiers = if spec.kind == SubagentToolKind::InvokeSubagent {
+        ResolvedTiers::detect()
+    } else {
+        ResolvedTiers::server_default()
+    };
+    Ok(resolve_subagent_policy(spec, summary, &targets, &tiers))
 }
 
 /// Decision API 응답 요약과 안전 가드레일(작성자 하한선, 교차 검증 보존, 과도한 강등 방지)을 결합해 최종 모델을 결정합니다.
@@ -254,12 +266,11 @@ pub fn resolve_subagent_policy(
     spec: &SubagentCallSpec,
     summary: RouteDecisionSummary,
     targets: &ModelTargets,
+    tiers: &ResolvedTiers,
 ) -> SubagentRouteOutcome {
     match spec.kind {
         SubagentToolKind::SwarmAdd => resolve_swarm_add_policy(spec, summary, targets),
-        SubagentToolKind::InvokeSubagent => {
-            resolve_invoke_subagent_policy(spec, summary, &TierModels::from_env())
-        }
+        SubagentToolKind::InvokeSubagent => resolve_invoke_subagent_policy(spec, summary, tiers),
     }
 }
 
@@ -300,6 +311,7 @@ fn resolve_swarm_add_policy(
                         summary.complexity_score, spec.requested_model, upgraded
                     ),
                     route_summary: Some(summary),
+                    tiers: None,
                 };
             }
         }
@@ -372,14 +384,16 @@ fn resolve_swarm_add_policy(
         guard_applied,
         reason,
         route_summary: Some(summary),
+        tiers: None,
     }
 }
 
 fn resolve_invoke_subagent_policy(
     spec: &SubagentCallSpec,
     summary: RouteDecisionSummary,
-    tiers: &TierModels,
+    resolved: &ResolvedTiers,
 ) -> SubagentRouteOutcome {
+    let tiers = &resolved.models;
     let is_research = spec.target_name.eq_ignore_ascii_case("research");
     let effective_req = if spec.requested_model.is_empty() {
         "inherit"
@@ -406,12 +420,13 @@ fn resolve_invoke_subagent_policy(
 
     let rewritten = !effective_req.eq_ignore_ascii_case(target_tier);
     let reason = format!(
-        "Decision subagent 라우팅(type={}, tier={}, score={:.2}, conf={:.0}%{}{}) -> {}",
+        "Decision subagent 라우팅(type={}, tier={}, score={:.2}, conf={:.0}%, tiers={}({}){}) -> {}",
         spec.target_name,
         summary.task_tier,
         summary.complexity_score,
         summary.tier_confidence * 100.0,
-        if aligned { ", tiers=aligned" } else { "" },
+        if aligned { "aligned" } else { "server" },
+        resolved.source_kind(),
         guard_applied
             .as_deref()
             .map(|g| format!(", guard={g}"))
@@ -430,6 +445,7 @@ fn resolve_invoke_subagent_policy(
         guard_applied,
         reason,
         route_summary: Some(summary),
+        tiers: Some(resolved.describe()),
     }
 }
 
@@ -601,6 +617,7 @@ fn passthrough_outcome(
         guard_applied: guard.map(ToString::to_string),
         reason: msg.to_string(),
         route_summary: summary,
+        tiers: None,
     }
 }
 
@@ -663,14 +680,6 @@ impl TierModels {
         out
     }
 
-    pub fn from_env() -> Self {
-        std::env::var("AGY_TIER_MODELS")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(|v| Self::parse(&v))
-            .unwrap_or_else(Self::server_default)
-    }
-
     fn get(&self, tier: &str) -> &str {
         match tier {
             "flash_lite" => &self.flash_lite,
@@ -683,6 +692,224 @@ impl TierModels {
     pub fn family_aligned(&self) -> bool {
         model_rank(&self.flash_lite).0 == 1 && model_rank(&self.flash).0 == 2 && model_rank(&self.pro).0 == 3
     }
+}
+
+/// 티어 표와 그 출처. `source` 는 `env` / `auto:<바이너리>` / `default:<이유>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTiers {
+    pub models: TierModels,
+    pub source: String,
+}
+
+/// 자동 감지 결과 캐시. 바이너리 식별자(`key`)가 같으면 다시 묻지 않는다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TierCache {
+    key: String,
+    binary: String,
+    tiers: Option<String>,
+    error: Option<String>,
+    checked_at: u64,
+}
+
+/// 감지에 실패한 결과는 이 시간이 지나면 다시 묻는다 (agy-cli-patch 를 나중에 설치한 경우 등)
+const TIER_FAILURE_RETRY_SECS: u64 = 600;
+const TIER_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl ResolvedTiers {
+    pub fn server_default() -> Self {
+        Self { models: TierModels::server_default(), source: "default".to_string() }
+    }
+
+    /// `AGY_TIER_MODELS` 가 표면 그대로(수동 고정), 비었거나 `auto` 면 실행 중인 agy 바이너리에서
+    /// `agy-cli-patch --tiers` 로 읽고(바이너리별 캐시), 그것도 안 되면 서버 기본값을 쓴다.
+    pub fn detect() -> Self {
+        resolve_tiers_with(
+            std::env::var("AGY_TIER_MODELS").ok().as_deref(),
+            find_agy_binary(),
+            &tier_cache_path(),
+            now_secs(),
+            query_tiers_via_cli,
+        )
+    }
+
+    /// `env` / `auto` / `default`
+    pub fn source_kind(&self) -> &str {
+        self.source.split(':').next().unwrap_or("default")
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "{} pro={} flash={} flash_lite={}",
+            self.source, self.models.pro, self.models.flash, self.models.flash_lite
+        )
+    }
+}
+
+fn resolve_tiers_with(
+    env_value: Option<&str>,
+    binary: Option<PathBuf>,
+    cache_path: &Path,
+    now: u64,
+    query: impl Fn(&Path) -> Result<String, String>,
+) -> ResolvedTiers {
+    if let Some(v) = env_value.map(str::trim).filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("auto")) {
+        return ResolvedTiers { models: TierModels::parse(v), source: "env".to_string() };
+    }
+    let fallback = |why: &str| ResolvedTiers {
+        models: TierModels::server_default(),
+        source: format!("default:{why}"),
+    };
+    let Some(binary) = binary else {
+        return fallback("agy 바이너리를 찾지 못함");
+    };
+    let Some(key) = binary_key(&binary) else {
+        return fallback("agy 바이너리 정보를 읽지 못함");
+    };
+    let cached = fs::read_to_string(cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<TierCache>(&raw).ok())
+        .filter(|c| c.key == key && (c.tiers.is_some() || now.saturating_sub(c.checked_at) < TIER_FAILURE_RETRY_SECS));
+    let entry = match cached {
+        Some(c) => c,
+        None => {
+            let result = query(&binary);
+            let entry = TierCache {
+                key,
+                binary: binary.display().to_string(),
+                tiers: result.as_ref().ok().cloned(),
+                error: result.err(),
+                checked_at: now,
+            };
+            write_tier_cache(cache_path, &entry);
+            entry
+        }
+    };
+    match entry.tiers {
+        Some(line) => ResolvedTiers { models: TierModels::parse(&line), source: format!("auto:{}", entry.binary) },
+        None => fallback(entry.error.as_deref().unwrap_or("티어 질의 실패")),
+    }
+}
+
+/// 바이너리가 바뀌었는지 가르는 식별자. /proc/<pid>/exe 는 링크를 따라가 실행 중인 inode 를 본다.
+fn binary_key(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}:{}:{}.{}", meta.dev(), meta.ino(), meta.size(), meta.mtime(), meta.mtime_nsec()))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(format!("{}:{}", meta.len(), modified.as_nanos()))
+    }
+}
+
+/// 이 훅을 띄운 agy 실행 파일. Linux 는 조상 프로세스 중 실행 파일 이름이 `antigravity` 로 시작하는 것의
+/// `/proc/<pid>/exe` (실행 중 업데이트로 파일이 교체돼도 그 세션의 바이너리를 가리킨다). 없으면 `AGY_BIN`.
+fn find_agy_binary() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut pid = std::os::unix::process::parent_id();
+        for _ in 0..6 {
+            if pid <= 1 {
+                break;
+            }
+            let exe = PathBuf::from(format!("/proc/{pid}/exe"));
+            let is_agy = fs::read_link(&exe)
+                .ok()
+                .and_then(|t| t.file_name().map(|n| n.to_string_lossy().starts_with("antigravity")))
+                .unwrap_or(false);
+            if is_agy {
+                return Some(exe);
+            }
+            let Some(parent) = fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|stat| {
+                // "pid (comm) state ppid ..." — comm 에 공백·괄호가 있을 수 있어 마지막 ')' 뒤를 본다
+                let rest = stat.get(stat.rfind(')')? + 1..)?;
+                rest.split_whitespace().nth(1)?.parse::<u32>().ok()
+            }) else {
+                break;
+            };
+            pid = parent;
+        }
+    }
+    let raw = std::env::var("AGY_BIN").ok().filter(|v| !v.trim().is_empty())?;
+    let path = expand_home(raw.trim());
+    Some(fs::canonicalize(&path).unwrap_or(path))
+}
+
+fn expand_home(raw: &str) -> PathBuf {
+    match (raw.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(raw),
+    }
+}
+
+fn agy_cli_patch_bin() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("AGY_CLI_PATCH_BIN").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .chain(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin")))
+        .map(|dir| dir.join("agy-cli-patch"))
+        .find(|p| p.is_file())
+}
+
+/// `agy-cli-patch --tiers --bin <바이너리>` 한 줄 (고정된 티어만, 없으면 빈 줄)
+fn query_tiers_via_cli(binary: &Path) -> Result<String, String> {
+    let cli = agy_cli_patch_bin().ok_or_else(|| "agy-cli-patch 를 찾지 못함".to_string())?;
+    let mut child = Command::new(&cli)
+        .arg("--tiers")
+        .arg("--bin")
+        .arg(binary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("agy-cli-patch 실행 실패: {e}"))?;
+    let deadline = Instant::now() + TIER_QUERY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("agy-cli-patch --tiers 시간 초과".to_string());
+            }
+        }
+    }
+    let out = child.wait_with_output().map_err(|e| format!("agy-cli-patch 출력 읽기 실패: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(format!("agy-cli-patch --tiers 실패: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+fn tier_cache_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".local/state/agy-decision-lab/tier-models.json")
+}
+
+fn write_tier_cache(path: &Path, entry: &TierCache) {
+    let Ok(raw) = serde_json::to_string(entry) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    // 동시에 뜬 훅끼리 반쯤 쓴 파일을 읽지 않도록 임시 파일에 쓴 뒤 rename
+    let tmp = path.with_extension(format!("json.{}", std::process::id()));
+    if fs::write(&tmp, raw).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// 모델 이름(슬러그·표시 이름)의 (패밀리 서열, 추론 강도 서열).
@@ -836,7 +1063,7 @@ mod tests {
         });
         let spec = extract_subagent_call("swarm", &args, "Gemini 4 Carbon (Medium)").unwrap();
         let summary = mock_summary("gemini-4-hydrogen-low", "hydrogen", "hydrogen_quick", 0.6, 0.90);
-        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        let out = resolve_subagent_policy(&spec, summary, &default_targets(), &ResolvedTiers::server_default());
         assert!(out.rewritten);
         assert_eq!(out.selected_model, "gemini-4-hydrogen-medium");
         assert_eq!(
@@ -856,13 +1083,13 @@ mod tests {
         let spec = extract_subagent_call("swarm", &args, "Gemini 4 Carbon (Medium)").unwrap();
 
         let sum_high = mock_summary("gemini-4-hydrogen-high", "hydrogen", "hydrogen_exec", 1.8, 0.90);
-        let out_high = resolve_subagent_policy(&spec, sum_high, &default_targets());
+        let out_high = resolve_subagent_policy(&spec, sum_high, &default_targets(), &ResolvedTiers::server_default());
         assert_eq!(out_high.selected_model, "gemini-4-hydrogen-high");
         assert!(out_high.guard_applied.is_none());
 
         let sum_xhigh =
             mock_summary("gemini-4-hydrogen-xhigh", "hydrogen", "hydrogen_exec", 2.4, 0.90);
-        let out_xhigh = resolve_subagent_policy(&spec, sum_xhigh, &default_targets());
+        let out_xhigh = resolve_subagent_policy(&spec, sum_xhigh, &default_targets(), &ResolvedTiers::server_default());
         assert_eq!(out_xhigh.selected_model, "gemini-4-hydrogen-xhigh");
         assert!(out_xhigh.guard_applied.is_none());
     }
@@ -884,7 +1111,7 @@ mod tests {
             2.6,
             0.91,
         );
-        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        let out = resolve_subagent_policy(&spec, summary, &default_targets(), &ResolvedTiers::server_default());
         assert!(out.rewritten);
         assert_eq!(out.selected_model, "claude-sonnet-5-5-high");
     }
@@ -905,7 +1132,7 @@ mod tests {
             0.85,
             0.88,
         );
-        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        let out = resolve_subagent_policy(&spec, summary, &default_targets(), &ResolvedTiers::server_default());
         assert!(out.rewritten);
         assert_eq!(out.model_arg_key, "Model");
         assert_eq!(out.selected_model, "flash");
@@ -928,7 +1155,7 @@ mod tests {
             3.5,
             0.93,
         );
-        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        let out = resolve_subagent_policy(&spec, summary, &default_targets(), &ResolvedTiers::server_default());
         assert!(!out.rewritten);
         assert_eq!(out.selected_model, "inherit");
     }
@@ -943,7 +1170,7 @@ mod tests {
         let spec =
             extract_subagent_call("invoke_subagent", &args, "Gemini 4 Hydrogen (Low)").unwrap();
         let summary = mock_summary("gemini-4-neon-medium", "neon", "neon_balanced", 1.7, 0.85);
-        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        let out = resolve_subagent_policy(&spec, summary, &default_targets(), &ResolvedTiers::server_default());
         assert!(out.rewritten);
         assert_eq!(out.selected_model, "pro");
     }
@@ -958,7 +1185,7 @@ mod tests {
         });
         let spec = extract_subagent_call("swarm", &args, "Gemini 4 Neon (High)").unwrap();
         let summary = mock_summary("gemini-4-neon-xhigh", "neon", "neon_balanced", 3.1, 0.91);
-        let out = resolve_subagent_policy(&spec, summary, &default_targets());
+        let out = resolve_subagent_policy(&spec, summary, &default_targets(), &ResolvedTiers::server_default());
         assert_eq!(out.selected_model, "gemini-4-neon-xhigh");
         assert!(out.guard_applied.is_none());
     }
@@ -983,7 +1210,7 @@ mod tests {
             args["Model"] = m.into();
         }
         let spec = extract_subagent_call("invoke_subagent", &args, parent).unwrap();
-        resolve_invoke_subagent_policy(&spec, summary, tiers)
+        resolve_invoke_subagent_policy(&spec, summary, &ResolvedTiers { models: tiers.clone(), source: "test".into() })
     }
 
     #[test]
@@ -1049,6 +1276,60 @@ mod tests {
         // 명시적 pro 는 강등하지 않는다
         let out = route_invoke("self", None, Some("pro"), "gemini-4-neon-high", s("gemini-4-neon-medium", "neon", "neon_balanced", 1.4), &t);
         assert_eq!((out.selected_model.as_str(), out.guard_applied.as_deref()), ("pro", Some("explicit_pro_downgrade_guard")));
+    }
+
+
+    #[test]
+    fn tier_detection_prefers_env_then_cached_binary_query_then_default() {
+        let dir = std::env::temp_dir().join(format!("tier-detect-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("tier-models.json");
+        let bin = dir.join("antigravity");
+        fs::write(&bin, b"v1").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let patched = |_: &Path| -> Result<String, String> {
+            calls.set(calls.get() + 1);
+            Ok("pro=gemini-4-carbon-high,flash=gemini-4-neon-medium,flash_lite=gemini-4-hydrogen-low".into())
+        };
+
+        // 수동 값이 있으면 바이너리를 묻지 않는다
+        let r = resolve_tiers_with(Some("pro=gemini-4-carbon-low"), Some(bin.clone()), &cache, 0, patched);
+        assert_eq!((r.source.as_str(), r.models.pro.as_str(), calls.get()), ("env", "gemini-4-carbon-low", 0));
+
+        // auto: 처음엔 묻고, 같은 바이너리면 캐시
+        for _ in 0..2 {
+            let r = resolve_tiers_with(Some("auto"), Some(bin.clone()), &cache, 100, patched);
+            assert!(r.models.family_aligned());
+            assert_eq!(r.source_kind(), "auto");
+        }
+        assert_eq!(calls.get(), 1);
+
+        // 바이너리가 바뀌면(크기·mtime·inode) 다시 묻는다 — 패치가 풀린 경우 빈 줄 -> 서버 기본값
+        fs::write(&bin, b"v2-unpatched").unwrap();
+        let r = resolve_tiers_with(None, Some(bin.clone()), &cache, 200, |_: &Path| Ok(String::new()));
+        assert_eq!(r.models, TierModels::server_default());
+        assert_eq!(r.source_kind(), "auto");
+
+        // 질의 실패는 서버 기본값, 10분 동안은 캐시, 그 뒤 재시도
+        fs::write(&bin, b"v3-broken!!").unwrap();
+        let failed = std::cell::Cell::new(0);
+        let fail = |_: &Path| -> Result<String, String> {
+            failed.set(failed.get() + 1);
+            Err("agy-cli-patch 를 찾지 못함".into())
+        };
+        for now in [1_000, 1_000 + TIER_FAILURE_RETRY_SECS - 1] {
+            let r = resolve_tiers_with(None, Some(bin.clone()), &cache, now, fail);
+            assert_eq!((r.models.clone(), r.source_kind()), (TierModels::server_default(), "default"));
+        }
+        assert_eq!(failed.get(), 1);
+        resolve_tiers_with(None, Some(bin.clone()), &cache, 1_000 + TIER_FAILURE_RETRY_SECS, fail);
+        assert_eq!(failed.get(), 2);
+
+        // 바이너리를 못 찾으면 서버 기본값
+        let r = resolve_tiers_with(None, None, &cache, 0, patched);
+        assert_eq!(r.source_kind(), "default");
+        let _ = fs::remove_dir_all(&dir);
     }
 
 }

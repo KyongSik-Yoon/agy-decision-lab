@@ -11,7 +11,7 @@ use agy_decision_lab::{
     gate::evaluate_command_for_hook,
     router::{ModelTargets, classify_prompt_with_timeout},
     stop_gate::{StopHookContext, evaluate_stop_hook},
-    subagent_router::{SubagentRouteOutcome, evaluate_subagent_for_hook, extract_subagent_call},
+    subagent_router::{ResolvedTiers, SubagentRouteOutcome, evaluate_subagent_for_hook, extract_subagent_call},
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -247,6 +247,12 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
                     "enabled"
                 },
                 subagent_install_mode
+            );
+            let tiers = ResolvedTiers::detect();
+            println!(
+                "Tiers         (invoke_subagent 티어 표): {} — {}",
+                if tiers.models.family_aligned() { "aligned" } else { "server" },
+                tiers.describe()
             );
             println!(
                 "Stop          (완료 체크리스트 검증):   {} (플러그인: {})",
@@ -582,6 +588,7 @@ fn append_subagent_audit_log(
         "score": outcome.route_summary.as_ref().map(|s| s.complexity_score),
         "confidence": outcome.route_summary.as_ref().map(|s| s.tier_confidence),
         "latency_ms": outcome.route_summary.as_ref().map(|s| s.latency_ms),
+        "tiers": outcome.tiers,
     });
     if let Ok(line) = serde_json::to_string(&record) {
         let mut opts = OpenOptions::new();

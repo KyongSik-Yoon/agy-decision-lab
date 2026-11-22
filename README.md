@@ -50,15 +50,14 @@ agy-decision-hook test-stop          # 현재 작업 트리의 git diff로 Stop 
 
 ## `invoke_subagent` 티어 모델 (`AGY_TIER_MODELS`)
 
-`invoke_subagent`는 모델을 티어(`inherit`/`flash_lite`/`flash`/`pro`)로만 받고, 실제 모델은 Antigravity 서버가 계정별로 정합니다(관측값: `pro` = `gemini-4-hydrogen-tiered-xhigh`, `flash_lite` = `gemini-3.5-flash-lite`). 라우터는 각 티어가 어떤 모델인지 알아야 올바르게 승격·보존하므로, [agy-cli-patch](https://github.com/KyongSik-Yoon/agy-cli-patch)의 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)로 바꿨다면 `config.env`에 그 표를 적습니다.
+`invoke_subagent`는 모델을 티어(`inherit`/`flash_lite`/`flash`/`pro`)로만 받고, 실제 모델은 Antigravity 서버가 계정별로 정합니다(관측값: `pro` = `gemini-4-hydrogen-tiered-xhigh`, `flash_lite` = `gemini-3.5-flash-lite`). [agy-cli-patch](https://github.com/KyongSik-Yoon/agy-cli-patch)의 티어 고정 패치(`pro-tier`·`flash-tier`·`flash-lite-tier`)로 바꿀 수 있으므로, 라우터는 각 티어가 지금 어떤 모델인지 알아야 올바르게 승격·보존합니다.
 
-```bash
-AGY_TIER_MODELS=pro=gemini-4-carbon-high,flash=gemini-4-neon-medium,flash_lite=gemini-4-hydrogen-low
-```
+- **기본값 `AGY_TIER_MODELS=auto`(또는 미설정)**: 훅을 띄운 agy 프로세스의 실행 파일(`/proc/<pid>/exe`, 찾지 못하면 `AGY_BIN`)을 `agy-cli-patch --tiers`로 읽어 티어 표를 정합니다. 결과는 바이너리 식별자(dev·inode·크기·mtime)별로 `~/.local/state/agy-decision-lab/tier-models.json`에 캐시되어, agy 업데이트·재설치·`--restore`·재패치로 바이너리가 바뀔 때만 다시 읽습니다. 실행 중에 업데이트로 파일이 교체돼도 그 세션이 실제로 돌리는 바이너리를 읽습니다. `agy-cli-patch`가 없거나 질의가 실패하면 서버 기본값을 쓰고 10분 뒤 다시 시도합니다.
+- **수동 고정**: `AGY_TIER_MODELS=pro=gemini-4-carbon-high,flash=gemini-4-neon-medium,flash_lite=gemini-4-hydrogen-low` 처럼 적으면 감지하지 않고 그 값을 씁니다(바이너리와 어긋나도 알지 못합니다).
+- 현재 표와 출처는 `agy-decision-hook status`의 `Tiers` 줄과 `subagent-routes.jsonl`의 `tiers` 필드에서 확인합니다.
 
 - **미설정(서버 기본값)**: 기존 정책을 쓰되, 고난도 작업을 `pro`로 올릴 때 부모가 이미 `pro` 모델보다 상위(예: Neon High 부모)면 `inherit`를 유지합니다(`preserve_parent_above_pro`).
 - **Hydrogen < Neon·Argon < Carbon 순서로 고정된 표**: 결정 모델이 고른 패밀리를 같은 패밀리 티어로 보냅니다(carbon→`pro`, neon·argon→`flash`, hydrogen→`flash_lite`). 코드를 쓰는 서브에이전트의 `flash_lite` 금지, Carbon 부모 강도 보존, 명시적 `pro` 강등 금지는 그대로입니다.
-- agy가 업데이트되어 티어 고정 패치가 풀리면 표와 실제가 어긋나므로, 패치를 다시 적용하거나 이 값을 지우세요.
 
 ## 보안 및 과금 분리 원칙
 
