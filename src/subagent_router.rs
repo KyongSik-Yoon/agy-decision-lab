@@ -810,33 +810,12 @@ fn binary_key(path: &Path) -> Option<String> {
     }
 }
 
-/// 이 훅을 띄운 agy 실행 파일. Linux 는 조상 프로세스 중 실행 파일 이름이 `antigravity` 로 시작하는 것의
-/// `/proc/<pid>/exe` (실행 중 업데이트로 파일이 교체돼도 그 세션의 바이너리를 가리킨다). 없으면 `AGY_BIN`.
+/// 이 훅을 띄운 agy 실행 파일: 조상 프로세스 중 실행 파일 이름이 `antigravity` 로 시작하는 것.
+/// Linux 는 `/proc/<pid>/exe` (실행 중 업데이트로 파일이 교체돼도 그 세션의 바이너리), macOS 는 그 경로.
+/// 찾지 못하면 `AGY_BIN`.
 fn find_agy_binary() -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut pid = std::os::unix::process::parent_id();
-        for _ in 0..6 {
-            if pid <= 1 {
-                break;
-            }
-            let exe = PathBuf::from(format!("/proc/{pid}/exe"));
-            let is_agy = fs::read_link(&exe)
-                .ok()
-                .and_then(|t| t.file_name().map(|n| n.to_string_lossy().starts_with("antigravity")))
-                .unwrap_or(false);
-            if is_agy {
-                return Some(exe);
-            }
-            let Some(parent) = fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|stat| {
-                // "pid (comm) state ppid ..." — comm 에 공백·괄호가 있을 수 있어 마지막 ')' 뒤를 본다
-                let rest = stat.get(stat.rfind(')')? + 1..)?;
-                rest.split_whitespace().nth(1)?.parse::<u32>().ok()
-            }) else {
-                break;
-            };
-            pid = parent;
-        }
+    if let Some(exe) = crate::agy_process::find_agy_ancestor() {
+        return Some(exe);
     }
     let raw = std::env::var("AGY_BIN").ok().filter(|v| !v.trim().is_empty())?;
     let path = expand_home(raw.trim());
