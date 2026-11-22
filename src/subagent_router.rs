@@ -784,9 +784,14 @@ fn resolve_tiers_with(
             entry
         }
     };
+    // 출처는 이번에 찾은 경로 (캐시의 경로는 같은 inode 를 다른 이름으로 가리킬 수 있다)
     match entry.tiers {
-        Some(line) => ResolvedTiers { models: TierModels::parse(&line), source: format!("auto:{}", entry.binary) },
-        None => fallback(entry.error.as_deref().unwrap_or("티어 질의 실패")),
+        Some(line) => ResolvedTiers { models: TierModels::parse(&line), source: format!("auto:{}", binary.display()) },
+        None => fallback(&format!(
+            "{} ({})",
+            entry.error.as_deref().unwrap_or("티어 질의 실패"),
+            binary.display()
+        )),
     }
 }
 
