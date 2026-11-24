@@ -471,7 +471,8 @@ pub fn commander_cap_enabled() -> bool {
 /// 서버 기본 티어(pro = Hydrogen xhigh 등) 및 비정렬 패치 티어(pro = Neon High/xhigh 등)일 때의 정책.
 /// - `pro`가 서버 기본값(Hydrogen)이면 부모가 상위일 때 내려가지 않도록 inherit 유지(`preserve_parent_above_pro`).
 /// - 지휘관 모드(`commander_cap`)가 켜져 있고 `pro`가 Neon급 이상(예: `gemini-4-neon-high`)으로 패치돼 있으면,
-///   부모가 Carbon 또는 Neon xhigh여도 서브에이전트 상한을 `pro` 티어로 제한한다(`commander_pro_cap`).
+///   부모가 Carbon·Neon xhigh이거나 내장 `Orchestrator` 모드여도 서브에이전트 상한을 `pro` 티어로 제한해
+///   비용 폭증과 중첩 오케스트레이터 상속을 막는다(`commander_pro_cap`).
 fn server_invoke_tier(
     spec: &SubagentCallSpec,
     summary: &RouteDecisionSummary,
@@ -484,8 +485,10 @@ fn server_invoke_tier(
     let (parent_family, parent_effort) = model_rank(&spec.parent_model);
     let (pro_family, pro_effort) = model_rank(&tiers.pro);
     let parent_is_neon_high_or_above = parent_family >= 2 && parent_effort >= 3;
+    let parent_is_orchestrator = is_orchestrator_parent(&spec.parent_model);
     let parent_above_pro = (parent_family, parent_effort) > (pro_family, pro_effort);
-    let commander_cap_active = commander_cap && parent_above_pro && pro_family >= 2;
+    let commander_cap_active =
+        commander_cap && (parent_above_pro || parent_is_orchestrator) && pro_family >= 2;
     let mut guard_applied: Option<String> = None;
     let upgrade_to_pro = |guard: &mut Option<String>| {
         if commander_cap_active {
@@ -646,7 +649,8 @@ fn aligned_invoke_tier(
     }
 
     let (want_family, want_effort) = model_rank(tiers.get(want));
-    if parent_family == want_family
+    if !is_orchestrator_parent(&spec.parent_model)
+        && parent_family == want_family
         && (parent_effort == want_effort || (desired_effort > want_effort && parent_effort >= desired_effort))
     {
         // 부모가 곧 그 티어 모델이거나, 결정 모델이 원한 강도를 부모만 채울 수 있으면 부모를 잇는다.
@@ -990,6 +994,11 @@ fn model_rank(name: &str) -> (u8, u8) {
         2
     };
     (family, effort)
+}
+
+/// 부모 세션이 agy 내장 오케스트레이터 모드(예: `"Orchestrator (Neon)"`)인지 판별한다.
+fn is_orchestrator_parent(model_name: &str) -> bool {
+    model_name.trim().to_ascii_lowercase().contains("orchestrator")
 }
 
 fn infer_parent_tier(model_name: &str) -> u8 {
@@ -1390,6 +1399,28 @@ mod tests {
         let spec_xh = make_spec("self", None, "gemini-4-neon-xhigh");
         let (tier_xh, guard_xh) = server_invoke_tier(&spec_xh, &mock_summary("gemini-4-carbon-high", "carbon", "carbon_complex", 3.3, 0.85), &neon_high_pro, true);
         assert_eq!((tier_xh, guard_xh.as_deref()), ("pro", Some("commander_pro_cap")));
+
+        // 내장 Orchestrator 부모도 지휘관 모드 ON + pro=neon-high 에서 중첩 상속 없이 pro(neon-high)로 캡핑
+        for orch_parent in ["Orchestrator (Neon)", "Orchestrator (Hydrogen)", "Orchestrator"] {
+            for (ty, ws, sum) in [
+                ("research", None, mock_summary("gemini-4-carbon-high", "carbon", "carbon_complex", 3.4, 0.82)),
+                ("self", Some("share"), mock_summary("gemini-4-neon-medium", "neon", "neon_balanced", 1.8, 0.85)),
+                ("self", Some("branch"), mock_summary("gemini-4-carbon-high", "carbon", "carbon_frontier", 3.6, 0.90)),
+            ] {
+                let spec_o = make_spec(ty, ws, orch_parent);
+                let (tier_o, guard_o) = server_invoke_tier(&spec_o, &sum, &neon_high_pro, true);
+                assert_eq!((tier_o, guard_o.as_deref()), ("pro", Some("commander_pro_cap")), "{orch_parent}/{ty}");
+            }
+            // 단순 research 는 Orchestrator 부모여도 기존처럼 flash / flash_lite 로 내려간다
+            let spec_or = make_spec("research", None, orch_parent);
+            let (tier_or, _) = server_invoke_tier(&spec_or, &mock_summary("gemini-4-hydrogen-low", "hydrogen", "hydrogen_quick", 0.3, 0.90), &neon_high_pro, true);
+            assert_eq!(tier_or, "flash_lite", "{orch_parent}");
+        }
+
+        // aligned 티어(pro=Carbon, flash=Neon)에서 Orchestrator (Neon) 부모의 Neon 작업은 inherit 대신 flash 단일 모델로 보낸다
+        let aligned = aligned_tiers();
+        let out_aligned_orch = route_invoke("self", None, None, "Orchestrator (Neon)", mock_summary("gemini-4-neon-medium", "neon", "neon_balanced", 1.6, 0.85), &aligned);
+        assert_eq!(out_aligned_orch.selected_model, "flash");
 
         // 지휘관 모드 OFF 면 기존처럼 Carbon 부모 상속(inherit) 복원
         let spec_off = make_spec("self", Some("branch"), "Gemini 4 Carbon (High)");
