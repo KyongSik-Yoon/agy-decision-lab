@@ -460,7 +460,9 @@ fn server_invoke_tier(
     let is_research = spec.target_name.eq_ignore_ascii_case("research");
     let is_mutating_ws = is_mutating_workspace(&spec.workspace);
     let parent_tier = infer_parent_tier(&spec.parent_model);
-    let parent_above_pro = model_rank(&spec.parent_model) > model_rank(&tiers.pro);
+    let (parent_family, parent_effort) = model_rank(&spec.parent_model);
+    let parent_is_neon_high_or_above = parent_family >= 2 && parent_effort >= 3;
+    let parent_above_pro = (parent_family, parent_effort) > model_rank(&tiers.pro);
     let mut guard_applied: Option<String> = None;
     let upgrade_to_pro = |guard: &mut Option<String>| {
         if parent_above_pro {
@@ -486,8 +488,15 @@ fn server_invoke_tier(
         } else if parent_tier >= 2 {
             // 부모가 이미 Carbon/Opus급이면 고난도 리서치 시 추론 강도까지 물려받는 inherit 우선
             "inherit"
+        } else if parent_above_pro {
+            guard_applied = Some("preserve_parent_above_pro".to_string());
+            "inherit"
+        } else if parent_is_neon_high_or_above {
+            // 읽기 전용 research 는 부모가 이미 Neon High 이상이면 pro(xhigh/carbon)로 과승격하지 않는다
+            guard_applied = Some("research_inherit_cap".to_string());
+            "inherit"
         } else {
-            upgrade_to_pro(&mut guard_applied)
+            "pro"
         }
     } else {
         // self 또는 커스텀 에이전트 (코드 작성·명령 실행 가능): flash_lite 절대 금지
@@ -533,8 +542,12 @@ fn server_invoke_tier(
                 }
             }
             _ => {
-                // carbon_complex / carbon_frontier
+                // carbon_complex / carbon_frontier (또는 2차 확신도 게이트로 carbon 승격된 neon_balanced)
                 if parent_tier >= 2 {
+                    "inherit"
+                } else if summary.task_tier == "neon_balanced" && parent_is_neon_high_or_above {
+                    // 1차 분류가 neon_balanced 인 작업은 2차 게이트만으로 pro(xhigh/carbon)까지 올리지 않는다
+                    guard_applied = Some("neon_balanced_inherit_guard".to_string());
                     "inherit"
                 } else {
                     upgrade_to_pro(&mut guard_applied)
@@ -554,6 +567,8 @@ fn aligned_invoke_tier(
 ) -> (&'static str, Option<String>) {
     let is_research = spec.target_name.eq_ignore_ascii_case("research");
     let is_mutating_ws = is_mutating_workspace(&spec.workspace);
+    let (parent_family, parent_effort) = model_rank(&spec.parent_model);
+    let parent_is_neon_high_or_above = parent_family >= 2 && parent_effort >= 3;
     let mut guard_applied: Option<String> = None;
 
     let mut want = match summary.selected_family.as_str() {
@@ -561,8 +576,19 @@ fn aligned_invoke_tier(
         "neon" | "argon" => "flash",
         _ => "flash_lite",
     };
-    // 원하는 추론 강도가 티어 모델보다 두 단계 이상 높으면 한 티어 위로 (예: Hydrogen xhigh 작업 -> Neon medium)
+
+    // 1차 분류가 neon_balanced 인 작업이 2차 확신도 게이트로 carbon/neon-xhigh 로 밀려 올라온 경우,
+    // 부모가 이미 Neon High 이상이면 pro(Carbon)로 과승격하지 않고 부모(inherit)를 유지한다.
     let (_, desired_effort) = model_rank(&summary.selected_model);
+    if summary.task_tier == "neon_balanced"
+        && parent_family == 2
+        && parent_effort >= 3
+        && (want == "pro" || desired_effort >= 4)
+    {
+        return ("inherit", Some("neon_balanced_inherit_guard".to_string()));
+    }
+
+    // 원하는 추론 강도가 티어 모델보다 두 단계 이상 높으면 한 티어 위로 (예: Hydrogen xhigh 작업 -> Neon medium)
     let (_, tier_effort) = model_rank(tiers.get(want));
     if desired_effort >= tier_effort + 2 {
         want = match want {
@@ -576,7 +602,11 @@ fn aligned_invoke_tier(
         guard_applied = Some("exec_subagent_floor".to_string());
     }
 
-    let (parent_family, parent_effort) = model_rank(&spec.parent_model);
+    // 읽기 전용 research 는 부모가 이미 Neon High 이상이면 pro(Carbon)로 과승격하지 않는다
+    if is_research && want == "pro" && parent_is_neon_high_or_above {
+        return ("inherit", Some("research_inherit_cap".to_string()));
+    }
+
     let (want_family, want_effort) = model_rank(tiers.get(want));
     if parent_family == want_family
         && (parent_effort == want_effort || (desired_effort > want_effort && parent_effort >= desired_effort))
@@ -1233,9 +1263,17 @@ mod tests {
         let t = aligned_tiers();
         let s = |m: &str, fam: &str, tier: &str, score: f64| mock_summary(m, fam, tier, score, 0.85);
 
-        // Carbon 작업: Neon 부모에서도 pro(=Carbon)로 올린다
-        let out = route_invoke("research", None, None, "gemini-4-neon-high", s("gemini-4-carbon-medium", "carbon", "carbon_complex", 3.25), &t);
+        // Carbon 구현 작업: Neon 부모에서도 pro(=Carbon)로 올린다
+        let out = route_invoke("self", None, None, "gemini-4-neon-high", s("gemini-4-carbon-medium", "carbon", "carbon_complex", 3.25), &t);
         assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("pro", true, None));
+        // 읽기 전용 research 는 Neon High 부모일 때 pro(Carbon)로 과승격하지 않고 inherit 상한 유지
+        let out = route_invoke("research", None, None, "gemini-4-neon-high", s("gemini-4-carbon-medium", "carbon", "carbon_complex", 3.25), &t);
+        assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("inherit", false, Some("research_inherit_cap")));
+        // 1차 분류가 neon_balanced 인 작업이 2차 게이트로 neon-xhigh/carbon 승격돼도 Neon High 부모면 inherit 유지
+        let out = route_invoke("self", None, None, "gemini-4-neon-high", mock_summary("gemini-4-neon-xhigh", "neon", "neon_balanced", 3.1, 0.55), &t);
+        assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("inherit", false, Some("neon_balanced_inherit_guard")));
+        let out = route_invoke("self", None, None, "gemini-4-neon-high", mock_summary("gemini-4-carbon-medium", "carbon", "neon_balanced", 2.7, 0.54), &t);
+        assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("inherit", false, Some("neon_balanced_inherit_guard")));
         // 부모가 곧 Carbon High 면 inherit
         let out = route_invoke("self", Some("branch"), None, "Gemini 4 Carbon (High)", s("gemini-4-carbon-high", "carbon", "carbon_frontier", 3.5), &t);
         assert_eq!(out.selected_model, "inherit");
@@ -1260,6 +1298,21 @@ mod tests {
         // 명시적 pro 는 강등하지 않는다
         let out = route_invoke("self", None, Some("pro"), "gemini-4-neon-high", s("gemini-4-neon-medium", "neon", "neon_balanced", 1.4), &t);
         assert_eq!((out.selected_model.as_str(), out.guard_applied.as_deref()), ("pro", Some("explicit_pro_downgrade_guard")));
+    }
+
+    #[test]
+    fn neon_xhigh_pro_tier_caps_research_and_neon_balanced_to_inherit() {
+        let neon_pro = TierModels::parse("pro=gemini-4-neon-xhigh, flash=gemini-4-neon-medium, flash_lite=gemini-4-hydrogen-low");
+        assert!(!neon_pro.family_aligned());
+        // 읽기 전용 research 는 carbon_complex 여도 Neon High 부모면 pro(neon-xhigh)로 과승격하지 않는다
+        let out = route_invoke("research", None, None, "gemini-4-neon-high", mock_summary("gemini-4-carbon-high", "carbon", "carbon_complex", 3.4, 0.80), &neon_pro);
+        assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("inherit", false, Some("research_inherit_cap")));
+        // 1차 분류가 neon_balanced 인 self 구현이 2차 게이트로 carbon 승격돼도 inherit 유지
+        let out = route_invoke("self", None, None, "gemini-4-neon-high", mock_summary("gemini-4-carbon-medium", "carbon", "neon_balanced", 2.8, 0.52), &neon_pro);
+        assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("inherit", false, Some("neon_balanced_inherit_guard")));
+        // 진짜 carbon_complex self 구현은 pro(neon-xhigh)로 정상 승격
+        let out = route_invoke("self", None, None, "gemini-4-neon-high", mock_summary("gemini-4-carbon-high", "carbon", "carbon_complex", 3.5, 0.85), &neon_pro);
+        assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("pro", true, None));
     }
 
 
