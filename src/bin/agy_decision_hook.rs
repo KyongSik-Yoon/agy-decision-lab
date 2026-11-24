@@ -11,7 +11,10 @@ use agy_decision_lab::{
     gate::evaluate_command_for_hook,
     router::{ModelTargets, classify_prompt_with_timeout},
     stop_gate::{StopHookContext, evaluate_stop_hook},
-    subagent_router::{ResolvedTiers, SubagentRouteOutcome, evaluate_subagent_for_hook, extract_subagent_call},
+    subagent_router::{
+        ResolvedTiers, SubagentRouteOutcome, commander_cap_enabled, commander_disabled_flag_path,
+        evaluate_subagent_for_hook, extract_subagent_call,
+    },
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -43,6 +46,10 @@ enum HookCmd {
     SubagentOn,
     /// PreToolUse 서브에이전트·스웜 동적 모델 라우터 일시 중지
     SubagentOff,
+    /// 지휘관 모드 활성화 (부모가 Carbon 등 상위 모델이어도 서브에이전트 상한을 Neon급 이상 pro 티어로 제한)
+    CommanderOn,
+    /// 지휘관 모드 비활성화 (고난도 서브에이전트의 부모 모델 상속 복원)
+    CommanderOff,
     /// 최근 서브에이전트·스웜 라우팅 감사 로그 출력
     SubagentLog {
         #[arg(short = 'n', long, default_value_t = 15)]
@@ -154,6 +161,7 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
     let gate_flag = gate_disabled_flag_path();
     let stop_flag = stop_disabled_flag_path();
     let subagent_flag = subagent_disabled_flag_path();
+    let commander_flag = commander_disabled_flag_path();
 
     match cmd {
         HookCmd::On => {
@@ -195,6 +203,16 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
         HookCmd::SubagentOff => {
             write_flag(&subagent_flag)?;
             println!("PreToolUse 서브에이전트·스웜 라우터 훅: DISABLED");
+        }
+        HookCmd::CommanderOn => {
+            if commander_flag.exists() {
+                fs::remove_file(&commander_flag)?;
+            }
+            println!("지휘관 모드 (서브에이전트 pro 티어 상한 캡): ENABLED");
+        }
+        HookCmd::CommanderOff => {
+            write_flag(&commander_flag)?;
+            println!("지휘관 모드 (서브에이전트 pro 티어 상한 캡): DISABLED");
         }
         HookCmd::SubagentLog { limit } => {
             let log_path = subagent_audit_log_path();
@@ -253,6 +271,23 @@ async fn handle_cli_subcommand(cmd: HookCmd) -> Result<()> {
                 "Tiers         (invoke_subagent 티어 표): {} — {}",
                 if tiers.models.family_aligned() { "aligned" } else { "server" },
                 tiers.describe()
+            );
+            let commander_on = commander_cap_enabled();
+            let commander_env = std::env::var("AGY_SUBAGENT_COMMANDER_CAP")
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            let commander_src = if let Some(v) = commander_env {
+                format!("env AGY_SUBAGENT_COMMANDER_CAP={v}")
+            } else if commander_flag.exists() {
+                "commander-off".to_string()
+            } else {
+                "default on".to_string()
+            };
+            println!(
+                "Commander     (지휘관 모드 상한 캡):     {} ({}, cap=pro:{})",
+                if commander_on { "enabled" } else { "disabled" },
+                commander_src,
+                tiers.models.pro
             );
             println!(
                 "Stop          (완료 체크리스트 검증):   {} (플러그인: {})",

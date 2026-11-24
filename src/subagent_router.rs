@@ -403,10 +403,11 @@ fn resolve_invoke_subagent_policy(
 
     // invoke_subagent 허용 티어: "inherit" | "flash_lite" | "flash" | "pro"
     let aligned = tiers.family_aligned();
+    let commander_cap = commander_cap_enabled();
     let (mut target_tier, mut guard_applied) = if aligned {
         aligned_invoke_tier(spec, &summary, tiers)
     } else {
-        server_invoke_tier(spec, &summary, tiers)
+        server_invoke_tier(spec, &summary, tiers, commander_cap)
     };
 
     // 호출자가 명시적으로 "pro"를 지정한 경우, 확실한 단순 research 조회가 아니면 강등 금지
@@ -449,23 +450,48 @@ fn resolve_invoke_subagent_policy(
     }
 }
 
-/// 서버 기본 티어(pro = Hydrogen xhigh 등)일 때의 정책.
-/// 고난도 작업을 "pro"로 올릴 때, 부모가 이미 `pro` 티어 모델보다 상위면(예: Neon High 부모 vs Hydrogen xhigh)
-/// 올리는 게 아니라 내리는 셈이므로 inherit 를 유지한다(`preserve_parent_above_pro`).
+/// 지휘관 모드 비활성화 플래그 파일 경로 (`~/.local/state/agy-decision-lab/commander-disabled`).
+pub fn commander_disabled_flag_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".local/state/agy-decision-lab/commander-disabled")
+}
+
+/// 지휘관 모드(부모가 Carbon 등 상위 모델이어도 서브에이전트 상한을 Neon급 이상 pro 티어로 제한) 활성화 여부.
+/// 우선순위: `AGY_SUBAGENT_COMMANDER_CAP` 환경변수 > `commander-disabled` 플래그 파일 (기본 ON).
+pub fn commander_cap_enabled() -> bool {
+    if let Ok(raw) = std::env::var("AGY_SUBAGENT_COMMANDER_CAP") {
+        let trimmed = raw.trim().to_ascii_lowercase();
+        if !trimmed.is_empty() {
+            return matches!(trimmed.as_str(), "1" | "true" | "yes" | "on");
+        }
+    }
+    !commander_disabled_flag_path().exists()
+}
+
+/// 서버 기본 티어(pro = Hydrogen xhigh 등) 및 비정렬 패치 티어(pro = Neon High/xhigh 등)일 때의 정책.
+/// - `pro`가 서버 기본값(Hydrogen)이면 부모가 상위일 때 내려가지 않도록 inherit 유지(`preserve_parent_above_pro`).
+/// - 지휘관 모드(`commander_cap`)가 켜져 있고 `pro`가 Neon급 이상(예: `gemini-4-neon-high`)으로 패치돼 있으면,
+///   부모가 Carbon 또는 Neon xhigh여도 서브에이전트 상한을 `pro` 티어로 제한한다(`commander_pro_cap`).
 fn server_invoke_tier(
     spec: &SubagentCallSpec,
     summary: &RouteDecisionSummary,
     tiers: &TierModels,
+    commander_cap: bool,
 ) -> (&'static str, Option<String>) {
     let is_research = spec.target_name.eq_ignore_ascii_case("research");
     let is_mutating_ws = is_mutating_workspace(&spec.workspace);
     let parent_tier = infer_parent_tier(&spec.parent_model);
     let (parent_family, parent_effort) = model_rank(&spec.parent_model);
+    let (pro_family, pro_effort) = model_rank(&tiers.pro);
     let parent_is_neon_high_or_above = parent_family >= 2 && parent_effort >= 3;
-    let parent_above_pro = (parent_family, parent_effort) > model_rank(&tiers.pro);
+    let parent_above_pro = (parent_family, parent_effort) > (pro_family, pro_effort);
+    let commander_cap_active = commander_cap && parent_above_pro && pro_family >= 2;
     let mut guard_applied: Option<String> = None;
     let upgrade_to_pro = |guard: &mut Option<String>| {
-        if parent_above_pro {
+        if commander_cap_active {
+            *guard = Some("commander_pro_cap".to_string());
+            "pro"
+        } else if parent_above_pro {
             *guard = Some("preserve_parent_above_pro".to_string());
             "inherit"
         } else {
@@ -485,6 +511,9 @@ fn server_invoke_tier(
                 && summary.complexity_score < 1.90)
         {
             "flash"
+        } else if commander_cap_active {
+            guard_applied = Some("commander_pro_cap".to_string());
+            "pro"
         } else if parent_tier >= 2 {
             // 부모가 이미 Carbon/Opus급이면 고난도 리서치 시 추론 강도까지 물려받는 inherit 우선
             "inherit"
@@ -507,6 +536,9 @@ fn server_invoke_tier(
                     && summary.tier_confidence >= 0.82
                 {
                     "flash"
+                } else if commander_cap_active {
+                    guard_applied = Some("commander_pro_cap".to_string());
+                    "pro"
                 } else if parent_tier == 1 {
                     "inherit"
                 } else if parent_tier == 0 {
@@ -523,7 +555,10 @@ fn server_invoke_tier(
                 }
             }
             "neon" | "argon" => {
-                if parent_tier == 0 {
+                if commander_cap_active {
+                    guard_applied = Some("commander_pro_cap".to_string());
+                    "pro"
+                } else if parent_tier == 0 {
                     // 부모가 Flash일 때 기능 구현 서브에이전트는 pro로 승격하여 성능 저하 방지
                     "pro"
                 } else if parent_tier == 1 {
@@ -543,7 +578,10 @@ fn server_invoke_tier(
             }
             _ => {
                 // carbon_complex / carbon_frontier (또는 2차 확신도 게이트로 carbon 승격된 neon_balanced)
-                if parent_tier >= 2 {
+                if commander_cap_active {
+                    guard_applied = Some("commander_pro_cap".to_string());
+                    "pro"
+                } else if parent_tier >= 2 {
                     "inherit"
                 } else if summary.task_tier == "neon_balanced" && parent_is_neon_high_or_above {
                     // 1차 분류가 neon_balanced 인 작업은 2차 게이트만으로 pro(xhigh/carbon)까지 올리지 않는다
@@ -1313,6 +1351,55 @@ mod tests {
         // 진짜 carbon_complex self 구현은 pro(neon-xhigh)로 정상 승격
         let out = route_invoke("self", None, None, "gemini-4-neon-high", mock_summary("gemini-4-carbon-high", "carbon", "carbon_complex", 3.5, 0.85), &neon_pro);
         assert_eq!((out.selected_model.as_str(), out.rewritten, out.guard_applied.as_deref()), ("pro", true, None));
+    }
+
+    #[test]
+    fn commander_mode_caps_carbon_and_xhigh_parents_to_neon_pro_and_respects_toggle() {
+        let neon_high_pro = TierModels::parse("pro=gemini-4-neon-high, flash=gemini-4-neon-medium, flash_lite=gemini-4-hydrogen-low");
+        let server = TierModels::server_default();
+
+        let make_spec = |type_name: &str, ws: Option<&str>, parent: &str| {
+            let mut args = serde_json::json!({ "TypeName": type_name, "Role": "Worker", "Prompt": "Do complex work." });
+            if let Some(w) = ws {
+                args["Workspace"] = w.into();
+            }
+            extract_subagent_call("invoke_subagent", &args, parent).unwrap()
+        };
+
+        // 지휘관 모드 ON + pro=neon-high: Carbon 부모의 고난도 research·self 및 neon_balanced self 모두 pro(neon-high)로 캡핑
+        for (ty, ws, sum) in [
+            ("research", None, mock_summary("gemini-4-carbon-high", "carbon", "carbon_complex", 3.4, 0.82)),
+            ("self", Some("share"), mock_summary("gemini-4-carbon-high", "carbon", "carbon_complex", 3.5, 0.86)),
+            ("self", Some("branch"), mock_summary("gemini-4-neon-high", "neon", "neon_balanced", 2.2, 0.80)),
+            ("self", Some("share"), mock_summary("gemini-4-hydrogen-high", "hydrogen", "hydrogen_exec", 1.8, 0.85)),
+        ] {
+            let spec = make_spec(ty, ws, "Gemini 4 Carbon (High)");
+            let (tier, guard) = server_invoke_tier(&spec, &sum, &neon_high_pro, true);
+            assert_eq!((tier, guard.as_deref()), ("pro", Some("commander_pro_cap")), "{ty}/{ws:?}");
+        }
+
+        // 초단순 research / 단순 self 는 지휘관 모드에서도 기존처럼 flash_lite / flash 로 내려간다
+        let spec_r = make_spec("research", None, "Gemini 4 Carbon (High)");
+        let (tier_r, _) = server_invoke_tier(&spec_r, &mock_summary("gemini-4-hydrogen-low", "hydrogen", "hydrogen_quick", 0.3, 0.90), &neon_high_pro, true);
+        assert_eq!(tier_r, "flash_lite");
+        let spec_s = make_spec("self", None, "Gemini 4 Carbon (High)");
+        let (tier_s, _) = server_invoke_tier(&spec_s, &mock_summary("gemini-4-hydrogen-medium", "hydrogen", "hydrogen_quick", 0.8, 0.90), &neon_high_pro, true);
+        assert_eq!(tier_s, "flash");
+
+        // Neon xhigh 부모도 pro=neon-high 로 캡핑
+        let spec_xh = make_spec("self", None, "gemini-4-neon-xhigh");
+        let (tier_xh, guard_xh) = server_invoke_tier(&spec_xh, &mock_summary("gemini-4-carbon-high", "carbon", "carbon_complex", 3.3, 0.85), &neon_high_pro, true);
+        assert_eq!((tier_xh, guard_xh.as_deref()), ("pro", Some("commander_pro_cap")));
+
+        // 지휘관 모드 OFF 면 기존처럼 Carbon 부모 상속(inherit) 복원
+        let spec_off = make_spec("self", Some("branch"), "Gemini 4 Carbon (High)");
+        let (tier_off, guard_off) = server_invoke_tier(&spec_off, &mock_summary("gemini-4-carbon-high", "carbon", "carbon_frontier", 3.5, 0.90), &neon_high_pro, false);
+        assert_eq!((tier_off, guard_off.as_deref()), ("inherit", None));
+
+        // 서버 기본 pro(Hydrogen xhigh)일 때는 지휘관 모드 ON이어도 Carbon/Neon 부모를 Hydrogen으로 강등하지 않음
+        let spec_srv = make_spec("self", Some("branch"), "Gemini 4 Carbon (High)");
+        let (tier_srv, _) = server_invoke_tier(&spec_srv, &mock_summary("gemini-4-carbon-high", "carbon", "carbon_frontier", 3.5, 0.90), &server, true);
+        assert_eq!(tier_srv, "inherit");
     }
 
 
